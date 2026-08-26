@@ -212,6 +212,9 @@ async def init_db():
                     created_at TEXT DEFAULT '',
                     PRIMARY KEY (user1_id, user2_id)
                 );
+                UPDATE users SET boosts_balance = 1 WHERE boosts_balance IS NULL OR boosts_balance = 0;
+                UPDATE users SET superlikes_balance = 1 WHERE superlikes_balance IS NULL;
+                UPDATE users SET boost_expires_at = '' WHERE boost_expires_at IS NULL;
             """)
         logging.info("Connected to Neon PostgreSQL and initialized schema.")
     else:
@@ -268,7 +271,6 @@ async def init_db():
                 )
             """)
 
-            # Apply SQLite column migrations safely
             columns_to_add = [
                 "phone_number TEXT DEFAULT ''",
                 "dating_goal TEXT DEFAULT 'Long-Term'",
@@ -296,6 +298,14 @@ async def init_db():
                     await db.execute(f"ALTER TABLE users ADD COLUMN {col}")
                 except Exception:
                     pass
+            
+            try:
+                await db.execute("UPDATE users SET boosts_balance = 1 WHERE boosts_balance IS NULL OR boosts_balance = 0")
+                await db.execute("UPDATE users SET superlikes_balance = 1 WHERE superlikes_balance IS NULL")
+                await db.execute("UPDATE users SET boost_expires_at = '' WHERE boost_expires_at IS NULL")
+            except Exception:
+                pass
+                
             await db.commit()
 
 
@@ -381,11 +391,11 @@ async def show_next_candidate(chat_id: int, user_id: int):
         await bot.send_message(chat_id, "Please set up your profile first using /start.")
         return
 
-    if current_user["is_banned"] == 1:
+    if current_user.get("is_banned", 0) == 1:
         await bot.send_message(chat_id, "🚫 <b>Your account has been suspended for violating community guidelines.</b>", parse_mode="HTML")
         return
 
-    if current_user["is_approved"] == 0:
+    if current_user.get("is_approved", 0) == 0:
         await bot.send_message(
             chat_id,
             "⏳ <b>Your profile is pending admin manual verification.</b>\n"
@@ -780,8 +790,8 @@ async def process_bio(message: types.Message, state: FSMContext):
     if ref_by and ref_by != uid:
         await db_execute("""
             UPDATE users 
-            SET superlikes_balance = superlikes_balance + 3,
-                boosts_balance = boosts_balance + 1
+            SET superlikes_balance = COALESCE(superlikes_balance, 0) + 3,
+                boosts_balance = COALESCE(boosts_balance, 0) + 1
             WHERE telegram_id = ?
         """, ref_by)
 
@@ -869,29 +879,32 @@ async def activate_boost_handler(callback: types.CallbackQuery):
         return
 
     # Check if already active
-    boost_exp = user.get("boost_expires_at", "") or ""
+    boost_exp = user.get("boost_expires_at") or ""
     if boost_exp and boost_exp > now_iso:
         try:
             exp = datetime.fromisoformat(boost_exp)
-            remaining_mins = int((exp - now).total_seconds() / 60)
+            remaining_mins = max(1, int((exp - now).total_seconds() / 60))
             await callback.answer(f"🚀 Your Boost is already active! {remaining_mins} mins remaining.", show_alert=True)
         except Exception:
             await callback.answer("🚀 Your Boost is currently active!", show_alert=True)
         return
 
-    # Check inventory balance
-    if user.get("boosts_balance", 0) <= 0 and user_id != ADMIN_ID:
+    # Check inventory balance safely
+    raw_bal = user.get("boosts_balance")
+    user_boosts = int(raw_bal) if raw_bal is not None else 0
+
+    if user_boosts <= 0 and user_id != ADMIN_ID:
         try:
             await callback.answer("🚀 You have 0 Boosts in inventory! Tap '🎁 Invite & Boost' to earn more.", show_alert=True)
         except Exception:
             pass
         return
 
-    # Set 1-hour expiration safely with ANSI SQL CASE expression
+    # Set 1-hour expiration safely
     boost_until = (now + timedelta(hours=1)).isoformat()
     await db_execute("""
         UPDATE users 
-        SET boosts_balance = (CASE WHEN boosts_balance > 0 THEN boosts_balance - 1 ELSE 0 END),
+        SET boosts_balance = (CASE WHEN COALESCE(boosts_balance, 0) > 0 THEN COALESCE(boosts_balance, 0) - 1 ELSE 0 END),
             boost_expires_at = ?
         WHERE telegram_id = ?
     """, boost_until, user_id)
@@ -919,8 +932,8 @@ async def show_invite_menu(message: types.Message):
     ref_count = await db_fetchval("SELECT COUNT(*) FROM users WHERE referred_by = ?", uid)
     u = await db_fetchrow("SELECT superlikes_balance, boosts_balance, boost_expires_at FROM users WHERE telegram_id = ?", uid)
 
-    sl_bal = u.get("superlikes_balance", 1) if u else 1
-    boost_bal = u.get("boosts_balance", 1) if u else 1
+    sl_bal = u.get("superlikes_balance") if (u and u.get("superlikes_balance") is not None) else 1
+    boost_bal = u.get("boosts_balance") if (u and u.get("boosts_balance") is not None) else 1
     now_iso = datetime.now().isoformat()
     boost_exp = u.get("boost_expires_at", "") if u else ""
     boost_active = "Active 🚀" if boost_exp and boost_exp > now_iso else "Inactive"
@@ -987,18 +1000,22 @@ async def show_profile(message: types.Message, state: FSMContext):
     status_tag = "✅ Approved & Verified" if user.get("is_verified", 0) == 1 else ("⏳ Under Review" if user.get("is_approved", 0) == 0 else "✓ Active")
     v_badge = " ✅ [Verified]" if user.get("is_verified", 0) == 1 else ""
 
-    boost_exp = user.get("boost_expires_at", "") or ""
+    boost_exp = user.get("boost_expires_at") or ""
+    raw_bal = user.get("boosts_balance")
+    boost_stock = int(raw_bal) if raw_bal is not None else 0
+
     if boost_exp and boost_exp > now_iso:
         try:
             exp = datetime.fromisoformat(boost_exp)
-            remaining_mins = int((exp - now).total_seconds() / 60)
+            remaining_mins = max(1, int((exp - now).total_seconds() / 60))
             boost_status = f"🚀 ACTIVE ({remaining_mins}m left)"
         except Exception:
             boost_status = "🚀 ACTIVE"
     else:
-        boost_status = f"Inactive ({user.get('boosts_balance', 0)} in stock)"
+        boost_status = f"Inactive ({boost_stock} in stock)"
 
     scope_display = "📍 Same City Only" if user.get("search_scope", "same_city") == "same_city" else "🇮🇳 All India (Nationwide)"
+    sl_stock = int(user.get("superlikes_balance")) if user.get("superlikes_balance") is not None else 0
 
     icebreaker_text = ""
     if user.get("icebreaker_question") and user.get("icebreaker_answer"):
@@ -1010,7 +1027,7 @@ async def show_profile(message: types.Message, state: FSMContext):
         f"🎯 <b>My Goal:</b> {my_goal_label}\n"
         f"🛡️ <b>Status:</b> {status_tag}\n"
         f"🚀 <b>Spotlight Boost:</b> {boost_status}\n"
-        f"⭐ <b>Super Likes:</b> {user.get('superlikes_balance', 0)}\n"
+        f"⭐ <b>Super Likes:</b> {sl_stock}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"❝ {user['bio']} ❞\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
@@ -1321,7 +1338,7 @@ async def handle_swipe(callback: types.CallbackQuery, state: FSMContext):
         
         await db_execute("""
             UPDATE users 
-            SET superlikes_balance = (CASE WHEN superlikes_balance > 0 THEN superlikes_balance - 1 ELSE 0 END) 
+            SET superlikes_balance = (CASE WHEN COALESCE(superlikes_balance, 0) > 0 THEN COALESCE(superlikes_balance, 0) - 1 ELSE 0 END) 
             WHERE telegram_id = ?
         """, swiper_id)
         action = "like"
