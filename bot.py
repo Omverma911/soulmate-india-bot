@@ -32,7 +32,12 @@ except ImportError:
 # --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8974109640:AAHNuuHALqJQFteuwMlaXiPjzYEjzzUDO8Q")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8925689319"))
-DATABASE_URL = os.environ.get("postgresql://neondb_owner:npg_Mu8WwZIelR4G@ep-muddy-sound-ayc0orm3-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require", "")
+
+# Paste your Neon URL here as default if you want direct local execution:
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://neondb_owner:npg_Mu8WwZIelR4G@ep-muddy-sound-ayc0orm3-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+)
 DAILY_SWIPE_LIMIT = 50
 
 logging.basicConfig(level=logging.INFO)
@@ -158,155 +163,165 @@ async def db_fetchval(query: str, *params):
 
 async def init_db():
     global pg_pool
-    if DATABASE_URL and asyncpg:
-        clean_url = DATABASE_URL
-        if clean_url.startswith("postgres://"):
-            clean_url = clean_url.replace("postgres://", "postgresql://", 1)
-        
-        logging.info("Connecting to Neon PostgreSQL...")
-        pg_pool = await asyncpg.create_pool(clean_url, max_size=10, min_size=1)
-
-        async with pg_pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    telegram_id BIGINT PRIMARY KEY,
-                    username TEXT DEFAULT '',
-                    phone_number TEXT DEFAULT '',
-                    name TEXT DEFAULT '',
-                    age INTEGER DEFAULT 18,
-                    gender TEXT DEFAULT '',
-                    target_gender TEXT DEFAULT 'Everyone',
-                    dating_goal TEXT DEFAULT 'Long-Term',
-                    intent_filter TEXT DEFAULT 'flexible',
-                    state TEXT DEFAULT 'India',
-                    city TEXT DEFAULT 'Other',
-                    photo_file_id TEXT DEFAULT '',
-                    selfie_file_id TEXT DEFAULT '',
-                    bio TEXT DEFAULT '',
-                    icebreaker_question TEXT DEFAULT '',
-                    icebreaker_answer TEXT DEFAULT '',
-                    reports_count INTEGER DEFAULT 0,
-                    superlikes_balance INTEGER DEFAULT 1,
-                    boosts_balance INTEGER DEFAULT 1,
-                    last_superlike_date TEXT DEFAULT '',
-                    daily_swipes_count INTEGER DEFAULT 0,
-                    last_swipe_date TEXT DEFAULT '',
-                    boost_expires_at TEXT DEFAULT '',
-                    referred_by BIGINT DEFAULT 0,
-                    search_scope TEXT DEFAULT 'same_city',
-                    is_approved INTEGER DEFAULT 0,
-                    is_verified INTEGER DEFAULT 0,
-                    is_banned INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS swipes (
-                    swiper_id BIGINT,
-                    target_id BIGINT,
-                    action TEXT,
-                    PRIMARY KEY (swiper_id, target_id)
-                );
-                CREATE TABLE IF NOT EXISTS matches (
-                    user1_id BIGINT,
-                    user2_id BIGINT,
-                    user1_shared INTEGER DEFAULT 0,
-                    user2_shared INTEGER DEFAULT 0,
-                    created_at TEXT DEFAULT '',
-                    PRIMARY KEY (user1_id, user2_id)
-                );
-                UPDATE users SET boosts_balance = 1 WHERE boosts_balance IS NULL OR boosts_balance = 0;
-                UPDATE users SET superlikes_balance = 1 WHERE superlikes_balance IS NULL;
-                UPDATE users SET boost_expires_at = '' WHERE boost_expires_at IS NULL;
-            """)
-        logging.info("Connected to Neon PostgreSQL and initialized schema.")
+    if not DATABASE_URL:
+        logging.warning("⚠️ DATABASE_URL environment variable is empty. Falling back to SQLite.")
+    elif asyncpg is None:
+        logging.warning("⚠️ asyncpg is not installed. Falling back to SQLite.")
     else:
-        logging.info("Using local SQLite storage (dating_bot.db)...")
-        async with aiosqlite.connect("dating_bot.db") as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    telegram_id INTEGER PRIMARY KEY,
-                    username TEXT DEFAULT '',
-                    phone_number TEXT DEFAULT '',
-                    name TEXT DEFAULT '',
-                    age INTEGER DEFAULT 18,
-                    gender TEXT DEFAULT '',
-                    target_gender TEXT DEFAULT 'Everyone',
-                    dating_goal TEXT DEFAULT 'Long-Term',
-                    intent_filter TEXT DEFAULT 'flexible',
-                    state TEXT DEFAULT 'India',
-                    city TEXT DEFAULT 'Other',
-                    photo_file_id TEXT DEFAULT '',
-                    selfie_file_id TEXT DEFAULT '',
-                    bio TEXT DEFAULT '',
-                    icebreaker_question TEXT DEFAULT '',
-                    icebreaker_answer TEXT DEFAULT '',
-                    reports_count INTEGER DEFAULT 0,
-                    superlikes_balance INTEGER DEFAULT 1,
-                    boosts_balance INTEGER DEFAULT 1,
-                    last_superlike_date TEXT DEFAULT '',
-                    daily_swipes_count INTEGER DEFAULT 0,
-                    last_swipe_date TEXT DEFAULT '',
-                    boost_expires_at TEXT DEFAULT '',
-                    referred_by INTEGER DEFAULT 0,
-                    search_scope TEXT DEFAULT 'same_city',
-                    is_approved INTEGER DEFAULT 0,
-                    is_verified INTEGER DEFAULT 0,
-                    is_banned INTEGER DEFAULT 0
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS swipes (
-                    swiper_id INTEGER,
-                    target_id INTEGER,
-                    action TEXT,
-                    PRIMARY KEY (swiper_id, target_id)
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS matches (
-                    user1_id INTEGER,
-                    user2_id INTEGER,
-                    user1_shared INTEGER DEFAULT 0,
-                    user2_shared INTEGER DEFAULT 0,
-                    created_at TEXT DEFAULT '',
-                    PRIMARY KEY (user1_id, user2_id)
-                )
-            """)
-
-            columns_to_add = [
-                "phone_number TEXT DEFAULT ''",
-                "dating_goal TEXT DEFAULT 'Long-Term'",
-                "intent_filter TEXT DEFAULT 'flexible'",
-                "search_scope TEXT DEFAULT 'same_city'",
-                "state TEXT DEFAULT 'India'",
-                "city TEXT DEFAULT 'Other'",
-                "reports_count INTEGER DEFAULT 0",
-                "superlikes_balance INTEGER DEFAULT 1",
-                "boosts_balance INTEGER DEFAULT 1",
-                "last_superlike_date TEXT DEFAULT ''",
-                "daily_swipes_count INTEGER DEFAULT 0",
-                "last_swipe_date TEXT DEFAULT ''",
-                "boost_expires_at TEXT DEFAULT ''",
-                "referred_by INTEGER DEFAULT 0",
-                "is_approved INTEGER DEFAULT 0",
-                "is_verified INTEGER DEFAULT 0",
-                "is_banned INTEGER DEFAULT 0",
-                "selfie_file_id TEXT DEFAULT ''",
-                "icebreaker_question TEXT DEFAULT ''",
-                "icebreaker_answer TEXT DEFAULT ''"
-            ]
-            for col in columns_to_add:
-                try:
-                    await db.execute(f"ALTER TABLE users ADD COLUMN {col}")
-                except Exception:
-                    pass
+        try:
+            clean_url = DATABASE_URL
+            if clean_url.startswith("postgres://"):
+                clean_url = clean_url.replace("postgres://", "postgresql://", 1)
             
+            logging.info("Connecting to Neon PostgreSQL...")
+            pg_pool = await asyncpg.create_pool(clean_url, max_size=10, min_size=1)
+
+            async with pg_pool.acquire() as conn:
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        telegram_id BIGINT PRIMARY KEY,
+                        username TEXT DEFAULT '',
+                        phone_number TEXT DEFAULT '',
+                        name TEXT DEFAULT '',
+                        age INTEGER DEFAULT 18,
+                        gender TEXT DEFAULT '',
+                        target_gender TEXT DEFAULT 'Everyone',
+                        dating_goal TEXT DEFAULT 'Long-Term',
+                        intent_filter TEXT DEFAULT 'flexible',
+                        state TEXT DEFAULT 'India',
+                        city TEXT DEFAULT 'Other',
+                        photo_file_id TEXT DEFAULT '',
+                        selfie_file_id TEXT DEFAULT '',
+                        bio TEXT DEFAULT '',
+                        icebreaker_question TEXT DEFAULT '',
+                        icebreaker_answer TEXT DEFAULT '',
+                        reports_count INTEGER DEFAULT 0,
+                        superlikes_balance INTEGER DEFAULT 1,
+                        boosts_balance INTEGER DEFAULT 1,
+                        last_superlike_date TEXT DEFAULT '',
+                        daily_swipes_count INTEGER DEFAULT 0,
+                        last_swipe_date TEXT DEFAULT '',
+                        boost_expires_at TEXT DEFAULT '',
+                        referred_by BIGINT DEFAULT 0,
+                        search_scope TEXT DEFAULT 'same_city',
+                        is_approved INTEGER DEFAULT 0,
+                        is_verified INTEGER DEFAULT 0,
+                        is_banned INTEGER DEFAULT 0
+                    );
+                    CREATE TABLE IF NOT EXISTS swipes (
+                        swiper_id BIGINT,
+                        target_id BIGINT,
+                        action TEXT,
+                        PRIMARY KEY (swiper_id, target_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS matches (
+                        user1_id BIGINT,
+                        user2_id BIGINT,
+                        user1_shared INTEGER DEFAULT 0,
+                        user2_shared INTEGER DEFAULT 0,
+                        created_at TEXT DEFAULT '',
+                        PRIMARY KEY (user1_id, user2_id)
+                    );
+                    UPDATE users SET boosts_balance = 1 WHERE boosts_balance IS NULL OR boosts_balance = 0;
+                    UPDATE users SET superlikes_balance = 1 WHERE superlikes_balance IS NULL;
+                    UPDATE users SET boost_expires_at = '' WHERE boost_expires_at IS NULL;
+                """)
+            logging.info("✅ SUCCESS: Connected to Neon PostgreSQL and initialized schema!")
+            return
+        except Exception as e:
+            logging.error(f"❌ Failed to connect to Neon PostgreSQL: {e}")
+            logging.warning("Falling back to local SQLite storage...")
+
+    # Fallback SQLite Initializer
+    logging.info("Using local SQLite storage (dating_bot.db)...")
+    async with aiosqlite.connect("dating_bot.db") as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                username TEXT DEFAULT '',
+                phone_number TEXT DEFAULT '',
+                name TEXT DEFAULT '',
+                age INTEGER DEFAULT 18,
+                gender TEXT DEFAULT '',
+                target_gender TEXT DEFAULT 'Everyone',
+                dating_goal TEXT DEFAULT 'Long-Term',
+                intent_filter TEXT DEFAULT 'flexible',
+                state TEXT DEFAULT 'India',
+                city TEXT DEFAULT 'Other',
+                photo_file_id TEXT DEFAULT '',
+                selfie_file_id TEXT DEFAULT '',
+                bio TEXT DEFAULT '',
+                icebreaker_question TEXT DEFAULT '',
+                icebreaker_answer TEXT DEFAULT '',
+                reports_count INTEGER DEFAULT 0,
+                superlikes_balance INTEGER DEFAULT 1,
+                boosts_balance INTEGER DEFAULT 1,
+                last_superlike_date TEXT DEFAULT '',
+                daily_swipes_count INTEGER DEFAULT 0,
+                last_swipe_date TEXT DEFAULT '',
+                boost_expires_at TEXT DEFAULT '',
+                referred_by INTEGER DEFAULT 0,
+                search_scope TEXT DEFAULT 'same_city',
+                is_approved INTEGER DEFAULT 0,
+                is_verified INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS swipes (
+                swiper_id INTEGER,
+                target_id INTEGER,
+                action TEXT,
+                PRIMARY KEY (swiper_id, target_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS matches (
+                user1_id INTEGER,
+                user2_id INTEGER,
+                user1_shared INTEGER DEFAULT 0,
+                user2_shared INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT '',
+                PRIMARY KEY (user1_id, user2_id)
+            )
+        """)
+
+        columns_to_add = [
+            "phone_number TEXT DEFAULT ''",
+            "dating_goal TEXT DEFAULT 'Long-Term'",
+            "intent_filter TEXT DEFAULT 'flexible'",
+            "search_scope TEXT DEFAULT 'same_city'",
+            "state TEXT DEFAULT 'India'",
+            "city TEXT DEFAULT 'Other'",
+            "reports_count INTEGER DEFAULT 0",
+            "superlikes_balance INTEGER DEFAULT 1",
+            "boosts_balance INTEGER DEFAULT 1",
+            "last_superlike_date TEXT DEFAULT ''",
+            "daily_swipes_count INTEGER DEFAULT 0",
+            "last_swipe_date TEXT DEFAULT ''",
+            "boost_expires_at TEXT DEFAULT ''",
+            "referred_by INTEGER DEFAULT 0",
+            "is_approved INTEGER DEFAULT 0",
+            "is_verified INTEGER DEFAULT 0",
+            "is_banned INTEGER DEFAULT 0",
+            "selfie_file_id TEXT DEFAULT ''",
+            "icebreaker_question TEXT DEFAULT ''",
+            "icebreaker_answer TEXT DEFAULT ''"
+        ]
+        for col in columns_to_add:
             try:
-                await db.execute("UPDATE users SET boosts_balance = 1 WHERE boosts_balance IS NULL OR boosts_balance = 0")
-                await db.execute("UPDATE users SET superlikes_balance = 1 WHERE superlikes_balance IS NULL")
-                await db.execute("UPDATE users SET boost_expires_at = '' WHERE boost_expires_at IS NULL")
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col}")
             except Exception:
                 pass
-                
-            await db.commit()
+        
+        try:
+            await db.execute("UPDATE users SET boosts_balance = 1 WHERE boosts_balance IS NULL OR boosts_balance = 0")
+            await db.execute("UPDATE users SET superlikes_balance = 1 WHERE superlikes_balance IS NULL")
+            await db.execute("UPDATE users SET boost_expires_at = '' WHERE boost_expires_at IS NULL")
+        except Exception:
+            pass
+            
+        await db.commit()
 
 
 # --- UI HELPERS ---
