@@ -18,7 +18,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-# Optional asyncpg import for PostgreSQL
+# Optional database driver imports
 try:
     import asyncpg
 except ImportError:
@@ -39,7 +39,6 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Global database pool
 pg_pool: Optional[asyncpg.Pool] = None
 
 # --- LOCATIONS DATA ---
@@ -96,11 +95,9 @@ GESTURES = [
     "🖐️ Hold up an OPEN PALM (5 fingers)"
 ]
 
-# --- DATABASE ABSTRACTION LAYER ---
+# --- DATABASE WRAPPER ---
 async def db_execute(query: str, *params):
-    """Executes an INSERT, UPDATE, or DELETE query on PostgreSQL or SQLite."""
     if pg_pool:
-        # Convert SQLite ? placeholders to Postgres $1, $2, ...
         parts = query.split("?")
         pg_query = parts[0]
         for i in range(1, len(parts)):
@@ -113,7 +110,6 @@ async def db_execute(query: str, *params):
             await db.commit()
 
 async def db_fetchrow(query: str, *params):
-    """Fetches a single row as a dictionary."""
     if pg_pool:
         parts = query.split("?")
         pg_query = parts[0]
@@ -130,7 +126,6 @@ async def db_fetchrow(query: str, *params):
             return dict(row) if row else None
 
 async def db_fetchall(query: str, *params):
-    """Fetches multiple rows as a list of dictionaries."""
     if pg_pool:
         parts = query.split("?")
         pg_query = parts[0]
@@ -147,7 +142,6 @@ async def db_fetchall(query: str, *params):
             return [dict(r) for r in rows]
 
 async def db_fetchval(query: str, *params):
-    """Fetches a single scalar value."""
     if pg_pool:
         parts = query.split("?")
         pg_query = parts[0]
@@ -165,7 +159,6 @@ async def db_fetchval(query: str, *params):
 async def init_db():
     global pg_pool
     if DATABASE_URL and asyncpg:
-        # Standardize postgres url scheme
         clean_url = DATABASE_URL
         if clean_url.startswith("postgres://"):
             clean_url = clean_url.replace("postgres://", "postgresql://", 1)
@@ -194,6 +187,7 @@ async def init_db():
                     icebreaker_answer TEXT DEFAULT '',
                     reports_count INTEGER DEFAULT 0,
                     superlikes_balance INTEGER DEFAULT 1,
+                    boosts_balance INTEGER DEFAULT 1,
                     last_superlike_date TEXT DEFAULT '',
                     daily_swipes_count INTEGER DEFAULT 0,
                     last_swipe_date TEXT DEFAULT '',
@@ -226,23 +220,24 @@ async def init_db():
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     telegram_id INTEGER PRIMARY KEY,
-                    username TEXT,
+                    username TEXT DEFAULT '',
                     phone_number TEXT DEFAULT '',
-                    name TEXT,
-                    age INTEGER,
-                    gender TEXT,
-                    target_gender TEXT,
+                    name TEXT DEFAULT '',
+                    age INTEGER DEFAULT 18,
+                    gender TEXT DEFAULT '',
+                    target_gender TEXT DEFAULT 'Everyone',
                     dating_goal TEXT DEFAULT 'Long-Term',
                     intent_filter TEXT DEFAULT 'flexible',
-                    state TEXT,
-                    city TEXT,
-                    photo_file_id TEXT,
+                    state TEXT DEFAULT 'India',
+                    city TEXT DEFAULT 'Other',
+                    photo_file_id TEXT DEFAULT '',
                     selfie_file_id TEXT DEFAULT '',
-                    bio TEXT,
+                    bio TEXT DEFAULT '',
                     icebreaker_question TEXT DEFAULT '',
                     icebreaker_answer TEXT DEFAULT '',
                     reports_count INTEGER DEFAULT 0,
                     superlikes_balance INTEGER DEFAULT 1,
+                    boosts_balance INTEGER DEFAULT 1,
                     last_superlike_date TEXT DEFAULT '',
                     daily_swipes_count INTEGER DEFAULT 0,
                     last_swipe_date TEXT DEFAULT '',
@@ -268,10 +263,39 @@ async def init_db():
                     user2_id INTEGER,
                     user1_shared INTEGER DEFAULT 0,
                     user2_shared INTEGER DEFAULT 0,
-                    created_at TEXT,
+                    created_at TEXT DEFAULT '',
                     PRIMARY KEY (user1_id, user2_id)
                 )
             """)
+
+            # Apply SQLite column migrations safely
+            columns_to_add = [
+                "phone_number TEXT DEFAULT ''",
+                "dating_goal TEXT DEFAULT 'Long-Term'",
+                "intent_filter TEXT DEFAULT 'flexible'",
+                "search_scope TEXT DEFAULT 'same_city'",
+                "state TEXT DEFAULT 'India'",
+                "city TEXT DEFAULT 'Other'",
+                "reports_count INTEGER DEFAULT 0",
+                "superlikes_balance INTEGER DEFAULT 1",
+                "boosts_balance INTEGER DEFAULT 1",
+                "last_superlike_date TEXT DEFAULT ''",
+                "daily_swipes_count INTEGER DEFAULT 0",
+                "last_swipe_date TEXT DEFAULT ''",
+                "boost_expires_at TEXT DEFAULT ''",
+                "referred_by INTEGER DEFAULT 0",
+                "is_approved INTEGER DEFAULT 0",
+                "is_verified INTEGER DEFAULT 0",
+                "is_banned INTEGER DEFAULT 0",
+                "selfie_file_id TEXT DEFAULT ''",
+                "icebreaker_question TEXT DEFAULT ''",
+                "icebreaker_answer TEXT DEFAULT ''"
+            ]
+            for col in columns_to_add:
+                try:
+                    await db.execute(f"ALTER TABLE users ADD COLUMN {col}")
+                except Exception:
+                    pass
             await db.commit()
 
 
@@ -288,7 +312,7 @@ async def get_main_menu(user_id: int):
         keyboard=[
             [KeyboardButton(text="🔍 Discover"), KeyboardButton(text=likes_btn_text)],
             [KeyboardButton(text="👥 My Matches"), KeyboardButton(text="👤 My Profile")],
-            [KeyboardButton(text="🎁 Invite Friends"), KeyboardButton(text="📜 My History")],
+            [KeyboardButton(text="🎁 Invite & Boost"), KeyboardButton(text="📜 My History")],
             [KeyboardButton(text="⚙️ Preferences")]
         ],
         resize_keyboard=True
@@ -370,23 +394,22 @@ async def show_next_candidate(chat_id: int, user_id: int):
         )
         return
 
-    # Check Daily Swipe Limit
-    last_date = current_user["last_swipe_date"] or ""
-    swipes_used = current_user["daily_swipes_count"] if last_date == today else 0
+    last_date = current_user.get("last_swipe_date", "") or ""
+    swipes_used = current_user.get("daily_swipes_count", 0) if last_date == today else 0
 
     if swipes_used >= DAILY_SWIPE_LIMIT and current_user["telegram_id"] != ADMIN_ID:
         limit_msg = (
             f"🛑 <b>Daily Swipe Limit Reached ({DAILY_SWIPE_LIMIT}/{DAILY_SWIPE_LIMIT})</b>\n\n"
             f"Your limit resets at midnight! Want more swipes and free Super Likes?\n"
-            f"Tap <b>🎁 Invite Friends</b> to get a 24-hour Spotlight Boost!"
+            f"Tap <b>🎁 Invite & Boost</b> to earn rewards!"
         )
         menu = await get_main_menu(user_id)
         await bot.send_message(chat_id, limit_msg, reply_markup=menu, parse_mode="HTML")
         return
 
-    search_scope = current_user["search_scope"] or "same_city"
-    intent_filter = current_user["intent_filter"] or "flexible"
-    user_goal = current_user["dating_goal"] or "Long-Term"
+    search_scope = current_user.get("search_scope", "same_city") or "same_city"
+    intent_filter = current_user.get("intent_filter", "flexible") or "flexible"
+    user_goal = current_user.get("dating_goal", "Long-Term") or "Long-Term"
 
     query = """
         SELECT *, (CASE WHEN boost_expires_at > ? THEN 1 ELSE 0 END) AS is_boosted
@@ -422,7 +445,7 @@ async def show_next_candidate(chat_id: int, user_id: int):
 
     if not candidate:
         scope_msg = (
-            f"No more matching profiles in <b>{current_user['city']}</b> right now.\n"
+            f"No more matching profiles in <b>{current_user.get('city', 'Other')}</b> right now.\n"
             f"Tip: Try switching to <b>🇮🇳 All India</b> or <b>🌐 All Goals</b> in <b>⚙️ Preferences</b>!"
             if search_scope == "same_city"
             else "You're all caught up for now!\nCheck back soon or explore <b>💌 Likes Received</b>."
@@ -433,14 +456,14 @@ async def show_next_candidate(chat_id: int, user_id: int):
         await bot.send_message(chat_id, no_profile_text, reply_markup=menu, parse_mode="HTML")
         return
 
-    st_str = candidate["state"] or "India"
-    ct_str = candidate["city"] or "Other"
-    cand_goal_label = GOAL_LABELS.get(candidate["dating_goal"], "☕ Dates & Explore")
-    v_badge = " ✅ [Verified]" if candidate["is_verified"] == 1 else ""
-    boost_badge = " 🚀 [Spotlight Boost]" if candidate.get("is_boosted") == 1 else ""
+    st_str = candidate.get("state", "India") or "India"
+    ct_str = candidate.get("city", "Other") or "Other"
+    cand_goal_label = GOAL_LABELS.get(candidate.get("dating_goal", "Open"), "☕ Dates & Explore")
+    v_badge = " ✅ [Verified]" if candidate.get("is_verified", 0) == 1 else ""
+    boost_badge = " 🚀 [Spotlight #1]" if candidate.get("is_boosted", 0) == 1 else ""
 
     icebreaker_section = ""
-    if candidate["icebreaker_question"] and candidate["icebreaker_answer"]:
+    if candidate.get("icebreaker_question") and candidate.get("icebreaker_answer"):
         icebreaker_section = (
             f"\n💡 <i>{candidate['icebreaker_question']}</i>\n"
             f"👉 <b>{candidate['icebreaker_answer']}</b>\n"
@@ -479,7 +502,7 @@ async def show_next_candidate(chat_id: int, user_id: int):
     )
 
 
-# --- ONBOARDING & VIRAL REFERRAL FLOW ---
+# --- ONBOARDING FLOW ---
 @dp.message(CommandStart(deep_link=True))
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext, command: CommandObject = None):
@@ -498,12 +521,12 @@ async def cmd_start(message: types.Message, state: FSMContext, command: CommandO
     user = await db_fetchrow("SELECT * FROM users WHERE telegram_id = ?", uid)
 
     if user:
-        if user["is_banned"] == 1:
+        if user.get("is_banned", 0) == 1:
             await message.answer("🚫 <b>Your account is suspended.</b>", parse_mode="HTML")
             return
         
         status_note = ""
-        if user["is_approved"] == 0:
+        if user.get("is_approved", 0) == 0:
             status_note = "\n\n⏳ <i>Your profile is currently waiting for admin approval.</i>"
 
         welcome_back_text = (
@@ -746,31 +769,30 @@ async def process_bio(message: types.Message, state: FSMContext):
     is_approved_val = 1 if uid == ADMIN_ID else 0
     is_verified_val = 1 if uid == ADMIN_ID else 0
 
-    # Delete existing entry if re-registering
     await db_execute("DELETE FROM users WHERE telegram_id = ?", uid)
 
     await db_execute("""
         INSERT INTO users 
-        (telegram_id, username, phone_number, name, age, gender, target_gender, dating_goal, intent_filter, state, city, photo_file_id, selfie_file_id, bio, icebreaker_question, icebreaker_answer, reports_count, superlikes_balance, last_superlike_date, daily_swipes_count, last_swipe_date, boost_expires_at, referred_by, search_scope, is_approved, is_verified, is_banned)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'flexible', ?, ?, ?, ?, ?, ?, ?, 0, 1, '', 0, '', '', ?, 'same_city', ?, ?, 0)
+        (telegram_id, username, phone_number, name, age, gender, target_gender, dating_goal, intent_filter, state, city, photo_file_id, selfie_file_id, bio, icebreaker_question, icebreaker_answer, reports_count, superlikes_balance, boosts_balance, last_superlike_date, daily_swipes_count, last_swipe_date, boost_expires_at, referred_by, search_scope, is_approved, is_verified, is_banned)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'flexible', ?, ?, ?, ?, ?, ?, ?, 0, 1, 1, '', 0, '', '', ?, 'same_city', ?, ?, 0)
     """, uid, username, phone, name, age, gender, tgt_gender, goal, state_val, city_val, photo_file_id, selfie_file_id, bio, ice_q, ice_a, ref_by, is_approved_val, is_verified_val)
 
     if ref_by and ref_by != uid:
-        boost_time = (datetime.now() + timedelta(hours=24)).isoformat()
         await db_execute("""
             UPDATE users 
             SET superlikes_balance = superlikes_balance + 3,
-                boost_expires_at = ?
+                boosts_balance = boosts_balance + 1
             WHERE telegram_id = ?
-        """, boost_time, ref_by)
+        """, ref_by)
 
         try:
             await bot.send_message(
                 ref_by,
                 f"🎁 <b>REFERRAL REWARD UNLOCKED!</b>\n\n"
-                f"Your friend <b>{name}</b> just registered using your link!\n"
-                f"• ⭐ <b>+3 Super Likes</b> added to your account.\n"
-                f"• 🚀 <b>24-Hour Profile Spotlight Boost</b> activated!",
+                f"Your friend <b>{name}</b> just joined using your link!\n"
+                f"• ⭐ <b>+3 Super Likes</b> added\n"
+                f"• 🚀 <b>+1 Spotlight Boost (1-Hour Duration)</b> added to your inventory!\n\n"
+                f"Tap <b>👤 My Profile</b> whenever you want to activate your 1-hour boost!",
                 parse_mode="HTML"
             )
         except Exception:
@@ -830,8 +852,64 @@ async def process_bio(message: types.Message, state: FSMContext):
                 logging.warning(f"Failed to alert admin: {e}")
 
 
+# --- 1-HOUR ON-DEMAND BOOST ACTIVATION ---
+@dp.callback_query(F.data == "activate_boost_now")
+async def activate_boost_handler(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    now = datetime.now()
+    now_iso = now.isoformat()
+
+    user = await db_fetchrow("SELECT boosts_balance, boost_expires_at FROM users WHERE telegram_id = ?", user_id)
+
+    if not user:
+        try:
+            await callback.answer("Profile not found.")
+        except Exception:
+            pass
+        return
+
+    # Check if already active
+    boost_exp = user.get("boost_expires_at", "") or ""
+    if boost_exp and boost_exp > now_iso:
+        try:
+            exp = datetime.fromisoformat(boost_exp)
+            remaining_mins = int((exp - now).total_seconds() / 60)
+            await callback.answer(f"🚀 Your Boost is already active! {remaining_mins} mins remaining.", show_alert=True)
+        except Exception:
+            await callback.answer("🚀 Your Boost is currently active!", show_alert=True)
+        return
+
+    # Check inventory balance
+    if user.get("boosts_balance", 0) <= 0 and user_id != ADMIN_ID:
+        try:
+            await callback.answer("🚀 You have 0 Boosts in inventory! Tap '🎁 Invite & Boost' to earn more.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Set 1-hour expiration safely with ANSI SQL CASE expression
+    boost_until = (now + timedelta(hours=1)).isoformat()
+    await db_execute("""
+        UPDATE users 
+        SET boosts_balance = (CASE WHEN boosts_balance > 0 THEN boosts_balance - 1 ELSE 0 END),
+            boost_expires_at = ?
+        WHERE telegram_id = ?
+    """, boost_until, user_id)
+
+    try:
+        await callback.answer("🚀 1-Hour Spotlight Boost Activated! You are now #1 in your city stack.", show_alert=True)
+    except Exception:
+        pass
+
+    await callback.message.answer(
+        "🚀 <b>BOOST ACTIVATED FOR 1 HOUR!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Your profile has been pushed to the top of the discovery deck for active members nearby. Good luck!",
+        parse_mode="HTML"
+    )
+
+
 # --- VIRAL INVITE & REFERRALS ---
-@dp.message(F.text == "🎁 Invite Friends")
+@dp.message(F.text == "🎁 Invite & Boost")
 @dp.message(Command("invite"))
 async def show_invite_menu(message: types.Message):
     uid = message.from_user.id
@@ -839,34 +917,43 @@ async def show_invite_menu(message: types.Message):
     referral_link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
 
     ref_count = await db_fetchval("SELECT COUNT(*) FROM users WHERE referred_by = ?", uid)
-    u = await db_fetchrow("SELECT superlikes_balance, boost_expires_at FROM users WHERE telegram_id = ?", uid)
+    u = await db_fetchrow("SELECT superlikes_balance, boosts_balance, boost_expires_at FROM users WHERE telegram_id = ?", uid)
 
-    sl_bal = u["superlikes_balance"] if u else 1
-    boost_active = "Active 🚀" if u and u["boost_expires_at"] and u["boost_expires_at"] > datetime.now().isoformat() else "Inactive"
+    sl_bal = u.get("superlikes_balance", 1) if u else 1
+    boost_bal = u.get("boosts_balance", 1) if u else 1
+    now_iso = datetime.now().isoformat()
+    boost_exp = u.get("boost_expires_at", "") if u else ""
+    boost_active = "Active 🚀" if boost_exp and boost_exp > now_iso else "Inactive"
 
     invite_msg = (
         f"🎁 <b>INVITE FRIENDS & GET REWARDED!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Share your referral link with friends on WhatsApp, Instagram, or Telegram.\n\n"
-        f"<b>YOUR REWARDS PER INVITE:</b>\n"
+        f"<b>YOUR REWARDS PER FRIEND INVITED:</b>\n"
         f"• ⭐ <b>+3 Free Super Likes</b>\n"
-        f"• 🚀 <b>24-Hour Profile Spotlight Boost</b> (Pushes your profile to #1 in your city)\n\n"
-        f"📊 <b>Your Referral Stats:</b>\n"
+        f"• 🚀 <b>+1 Spotlight Boost (1-Hour Duration)</b>\n\n"
+        f"📊 <b>Your Inventory & Stats:</b>\n"
         f"• 👥 Friends Invited: <b>{ref_count}</b>\n"
         f"• ⭐ Super Likes Balance: <b>{sl_bal}</b>\n"
-        f"• 🚀 Spotlight Boost Status: <b>{boost_active}</b>\n"
+        f"• 🚀 Available 1-Hour Boosts: <b>{boost_bal}</b>\n"
+        f"• ⚡ Current Boost Status: <b>{boost_active}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔗 <b>Your Personal Invite Link:</b>\n"
         f"<code>{referral_link}</code>"
     )
 
     share_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="📲 Share on Telegram",
-                url=f"https://t.me/share/url?url={referral_link}&text=Join%20Soulmate%20India%20to%20find%20authentic%20matches!"
-            )
-        ]]
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🚀 Activate 1-Hour Boost Now", callback_data="activate_boost_now")
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📲 Share Link on Telegram",
+                    url=f"https://t.me/share/url?url={referral_link}&text=Join%20Soulmate%20India%20to%20find%20authentic%20matches!"
+                )
+            ]
+        ]
     )
 
     await message.answer(invite_msg, reply_markup=share_kb, parse_mode="HTML")
@@ -878,7 +965,8 @@ async def show_invite_menu(message: types.Message):
 async def show_profile(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    now_iso = datetime.now().isoformat()
+    now = datetime.now()
+    now_iso = now.isoformat()
 
     user = await db_fetchrow("SELECT * FROM users WHERE telegram_id = ?", user_id)
 
@@ -886,9 +974,9 @@ async def show_profile(message: types.Message, state: FSMContext):
         await message.answer("You haven't set up a profile yet. Send /start to begin.")
         return
 
-    state_val = user["state"] or "India"
-    city_val = user["city"] or "Other"
-    my_goal_label = GOAL_LABELS.get(user["dating_goal"], "💍 Long-Term / True Love")
+    state_val = user.get("state", "India") or "India"
+    city_val = user.get("city", "Other") or "Other"
+    my_goal_label = GOAL_LABELS.get(user.get("dating_goal", "Long-Term"), "💍 Long-Term / True Love")
 
     total_likes = await db_fetchval("SELECT COUNT(*) FROM swipes WHERE target_id = ? AND action = 'like'", user_id)
     total_matches = await db_fetchval("SELECT COUNT(*) FROM matches WHERE user1_id = ? OR user2_id = ?", user_id, user_id)
@@ -896,13 +984,24 @@ async def show_profile(message: types.Message, state: FSMContext):
     city_user_count = await db_fetchval("SELECT COUNT(*) FROM users WHERE city = ? AND is_approved = 1", city_val)
     total_user_count = await db_fetchval("SELECT COUNT(*) FROM users WHERE is_approved = 1")
 
-    status_tag = "✅ Approved & Verified" if user["is_verified"] == 1 else ("⏳ Under Review" if user["is_approved"] == 0 else "✓ Active")
-    v_badge = " ✅ [Verified]" if user["is_verified"] == 1 else ""
-    boost_status = "🚀 ACTIVE (Spotlight #1)" if user["boost_expires_at"] and user["boost_expires_at"] > now_iso else "Inactive"
-    scope_display = "📍 Same City Only" if user["search_scope"] == "same_city" else "🇮🇳 All India (Nationwide)"
+    status_tag = "✅ Approved & Verified" if user.get("is_verified", 0) == 1 else ("⏳ Under Review" if user.get("is_approved", 0) == 0 else "✓ Active")
+    v_badge = " ✅ [Verified]" if user.get("is_verified", 0) == 1 else ""
+
+    boost_exp = user.get("boost_expires_at", "") or ""
+    if boost_exp and boost_exp > now_iso:
+        try:
+            exp = datetime.fromisoformat(boost_exp)
+            remaining_mins = int((exp - now).total_seconds() / 60)
+            boost_status = f"🚀 ACTIVE ({remaining_mins}m left)"
+        except Exception:
+            boost_status = "🚀 ACTIVE"
+    else:
+        boost_status = f"Inactive ({user.get('boosts_balance', 0)} in stock)"
+
+    scope_display = "📍 Same City Only" if user.get("search_scope", "same_city") == "same_city" else "🇮🇳 All India (Nationwide)"
 
     icebreaker_text = ""
-    if user["icebreaker_question"] and user["icebreaker_answer"]:
+    if user.get("icebreaker_question") and user.get("icebreaker_answer"):
         icebreaker_text = f"\n💡 <i>{user['icebreaker_question']}</i>\n👉 <b>{user['icebreaker_answer']}</b>\n━━━━━━━━━━━━━━━━━━━━━━"
 
     profile_card = (
@@ -911,7 +1010,7 @@ async def show_profile(message: types.Message, state: FSMContext):
         f"🎯 <b>My Goal:</b> {my_goal_label}\n"
         f"🛡️ <b>Status:</b> {status_tag}\n"
         f"🚀 <b>Spotlight Boost:</b> {boost_status}\n"
-        f"⭐ <b>Super Likes:</b> {user['superlikes_balance']}\n"
+        f"⭐ <b>Super Likes:</b> {user.get('superlikes_balance', 0)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"❝ {user['bio']} ❞\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
@@ -931,15 +1030,18 @@ async def show_profile(message: types.Message, state: FSMContext):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
+                InlineKeyboardButton(text="🚀 Activate 1-Hour Boost", callback_data="activate_boost_now"),
+                InlineKeyboardButton(text="🎁 Get More Boosts", callback_data="open_invite_btn")
+            ],
+            [
                 InlineKeyboardButton(text="✍️ Edit Bio", callback_data="edit_bio_btn"),
-                InlineKeyboardButton(text="📸 Change Photo", callback_data="edit_photo_btn"),
+                InlineKeyboardButton(text="📸 Change Photo", callback_data="edit_photo_btn")
             ],
             [
                 InlineKeyboardButton(text="📍 Update City", callback_data="edit_city_btn"),
-                InlineKeyboardButton(text="🎯 Change Goal", callback_data="edit_goal_btn"),
+                InlineKeyboardButton(text="🎯 Change Goal", callback_data="edit_goal_btn")
             ],
             [
-                InlineKeyboardButton(text="🎁 Invite & Boost", callback_data="open_invite_btn"),
                 InlineKeyboardButton(text="🗑️ Delete Account", callback_data="confirm_delete_btn")
             ]
         ]
@@ -1027,9 +1129,9 @@ async def show_preferences_menu(message: types.Message):
 
     user = await db_fetchrow("SELECT target_gender, search_scope, intent_filter, dating_goal FROM users WHERE telegram_id = ?", user_id)
 
-    current_scope = "📍 Same City Only" if user and user["search_scope"] == "same_city" else "🇮🇳 All India (Nationwide)"
-    current_tgt = user["target_gender"] if user else "Everyone"
-    current_filter = "🎯 Compatible Goals Only" if user and user["intent_filter"] == "strict" else "🌐 Show All Goals"
+    current_scope = "📍 Same City Only" if user and user.get("search_scope", "same_city") == "same_city" else "🇮🇳 All India (Nationwide)"
+    current_tgt = user.get("target_gender", "Everyone") if user else "Everyone"
+    current_filter = "🎯 Compatible Goals Only" if user and user.get("intent_filter", "flexible") == "strict" else "🌐 Show All Goals"
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1199,9 +1301,9 @@ async def handle_swipe(callback: types.CallbackQuery, state: FSMContext):
 
     swiper_info = await db_fetchrow("SELECT name, city, superlikes_balance, daily_swipes_count, last_swipe_date FROM users WHERE telegram_id = ?", swiper_id)
 
-    swiper_name = swiper_info["name"] if swiper_info else "Someone"
-    swiper_city = swiper_info["city"] if swiper_info else "nearby"
-    current_swipes = swiper_info["daily_swipes_count"] if swiper_info and swiper_info["last_swipe_date"] == today else 0
+    swiper_name = swiper_info.get("name", "Someone") if swiper_info else "Someone"
+    swiper_city = swiper_info.get("city", "nearby") if swiper_info else "nearby"
+    current_swipes = swiper_info.get("daily_swipes_count", 0) if swiper_info and swiper_info.get("last_swipe_date") == today else 0
 
     await db_execute(
         "UPDATE users SET daily_swipes_count = ?, last_swipe_date = ? WHERE telegram_id = ?",
@@ -1209,15 +1311,19 @@ async def handle_swipe(callback: types.CallbackQuery, state: FSMContext):
     )
 
     if action == "super":
-        sl_bal = swiper_info["superlikes_balance"] if swiper_info else 0
+        sl_bal = swiper_info.get("superlikes_balance", 0) if swiper_info else 0
         if sl_bal <= 0 and swiper_id != ADMIN_ID:
             try:
-                await callback.answer("⭐ You have 0 Super Likes remaining! Invite friends in '🎁 Invite Friends' to get more.", show_alert=True)
+                await callback.answer("⭐ You have 0 Super Likes remaining! Invite friends in '🎁 Invite & Boost' to get more.", show_alert=True)
             except Exception:
                 pass
             return
         
-        await db_execute("UPDATE users SET superlikes_balance = GREATEST(0, superlikes_balance - 1) WHERE telegram_id = ?", swiper_id)
+        await db_execute("""
+            UPDATE users 
+            SET superlikes_balance = (CASE WHEN superlikes_balance > 0 THEN superlikes_balance - 1 ELSE 0 END) 
+            WHERE telegram_id = ?
+        """, swiper_id)
         action = "like"
 
         try:
@@ -1331,11 +1437,11 @@ async def show_likes_received(message: types.Message, state: FSMContext):
         )
         return
 
-    admirer_goal_label = GOAL_LABELS.get(admirer["dating_goal"], "☕ Dates & Explore")
-    v_badge = " ✅ [Verified]" if admirer["is_verified"] == 1 else ""
+    admirer_goal_label = GOAL_LABELS.get(admirer.get("dating_goal", "Open"), "☕ Dates & Explore")
+    v_badge = " ✅ [Verified]" if admirer.get("is_verified", 0) == 1 else ""
 
     icebreaker_section = ""
-    if admirer["icebreaker_question"] and admirer["icebreaker_answer"]:
+    if admirer.get("icebreaker_question") and admirer.get("icebreaker_answer"):
         icebreaker_section = f"\n💡 <i>{admirer['icebreaker_question']}</i>\n👉 <b>{admirer['icebreaker_answer']}</b>\n━━━━━━━━━━━━━━━━━━━━━━"
 
     card_text = (
@@ -1452,9 +1558,9 @@ async def handle_share_contact(callback: types.CallbackQuery):
     except Exception:
         pass
 
-    if match_row and match_row["user1_shared"] == 1 and match_row["user2_shared"] == 1:
-        my_contact = f"@{me['username']}" if me['username'] else f"<a href='tg://user?id={my_id}'>Direct Telegram Link</a>"
-        partner_contact = f"@{partner['username']}" if partner['username'] else f"<a href='tg://user?id={partner_id}'>Direct Telegram Link</a>"
+    if match_row and match_row.get("user1_shared", 0) == 1 and match_row.get("user2_shared", 0) == 1:
+        my_contact = f"@{me['username']}" if me.get('username') else f"<a href='tg://user?id={my_id}'>Direct Telegram Link</a>"
+        partner_contact = f"@{partner['username']}" if partner.get('username') else f"<a href='tg://user?id={partner_id}'>Direct Telegram Link</a>"
 
         await callback.message.answer(
             f"🔓 <b>Mutual Handle Unlocked!</b>\n\n"
@@ -1516,13 +1622,13 @@ async def list_matches(message: types.Message, state: FSMContext):
 
     for m in matches:
         is_u1 = (user_id == m["user1_id"])
-        my_shared = m["user1_shared"] if is_u1 else m["user2_shared"]
-        partner_shared = m["user2_shared"] if is_u1 else m["user1_shared"]
-        m_goal_label = GOAL_LABELS.get(m["dating_goal"], "☕ Dates & Explore")
-        v_badge = " ✅ [Verified]" if m["is_verified"] == 1 else ""
+        my_shared = m.get("user1_shared", 0) if is_u1 else m.get("user2_shared", 0)
+        partner_shared = m.get("user2_shared", 0) if is_u1 else m.get("user1_shared", 0)
+        m_goal_label = GOAL_LABELS.get(m.get("dating_goal", "Open"), "☕ Dates & Explore")
+        v_badge = " ✅ [Verified]" if m.get("is_verified", 0) == 1 else ""
 
         if my_shared and partner_shared:
-            contact = f"@{m['username']}" if m['username'] else f"<a href='tg://user?id={m['telegram_id']}'>Direct Telegram Profile</a>"
+            contact = f"@{m['username']}" if m.get('username') else f"<a href='tg://user?id={m['telegram_id']}'>Direct Telegram Profile</a>"
             btn = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Open Chat on Telegram", url=f"tg://user?id={m['telegram_id']}")]])
             status = f"🔓 <b>Contact Unlocked:</b> {contact}"
         elif my_shared:
@@ -1605,10 +1711,10 @@ async def view_history_liked_handler(callback: types.CallbackQuery):
 
     for u in liked_users:
         status = "🎉 <b>Matched!</b>" if u.get("is_matched", 0) > 0 else "⏳ <i>Awaiting their response</i>"
-        st_str = u["state"] or "India"
-        ct_str = u["city"] or "Other"
-        g_label = GOAL_LABELS.get(u["dating_goal"], "☕ Dates & Explore")
-        v_badge = " ✅ [Verified]" if u["is_verified"] == 1 else ""
+        st_str = u.get("state", "India") or "India"
+        ct_str = u.get("city", "Other") or "Other"
+        g_label = GOAL_LABELS.get(u.get("dating_goal", "Open"), "☕ Dates & Explore")
+        v_badge = " ✅ [Verified]" if u.get("is_verified", 0) == 1 else ""
 
         card_text = (
             f"👤 <b>{u['name'].upper()}</b>{v_badge}, {u['age']}\n"
@@ -1646,10 +1752,10 @@ async def view_history_passed_handler(callback: types.CallbackQuery):
     await callback.message.answer(f"❌ <b>Profiles You Passed ({len(passed_users)}):</b>\n<i>You can tap Rewind to change your mind!</i>", parse_mode="HTML")
 
     for u in passed_users:
-        st_str = u["state"] or "India"
-        ct_str = u["city"] or "Other"
-        g_label = GOAL_LABELS.get(u["dating_goal"], "☕ Dates & Explore")
-        v_badge = " ✅ [Verified]" if u["is_verified"] == 1 else ""
+        st_str = u.get("state", "India") or "India"
+        ct_str = u.get("city", "Other") or "Other"
+        g_label = GOAL_LABELS.get(u.get("dating_goal", "Open"), "☕ Dates & Explore")
+        v_badge = " ✅ [Verified]" if u.get("is_verified", 0) == 1 else ""
 
         rewind_kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="↩️ Rewind & Like", callback_data=f"rewind_like_{u['telegram_id']}")]]
@@ -1887,22 +1993,22 @@ async def admin_inspect_user(message: types.Message):
         await message.answer(f"User <code>{target_id}</code> not found.", parse_mode="HTML")
         return
 
-    status = "🚫 BANNED" if u["is_banned"] == 1 else ("✅ APPROVED & VERIFIED" if u["is_verified"] == 1 else "⏳ PENDING")
+    status = "🚫 BANNED" if u.get("is_banned", 0) == 1 else ("✅ APPROVED & VERIFIED" if u.get("is_verified", 0) == 1 else "⏳ PENDING")
     inspect_text = (
         f"🔍 <b>USER DOSSIER: {u['name'].upper()}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 <b>Telegram ID:</b> <code>{u['telegram_id']}</code>\n"
-        f"🔗 <b>Username:</b> @{u['username'] if u['username'] else 'None'}\n"
-        f"📞 <b>Phone:</b> <code>{u['phone_number']}</code>\n"
+        f"🔗 <b>Username:</b> @{u.get('username') if u.get('username') else 'None'}\n"
+        f"📞 <b>Phone:</b> <code>{u.get('phone_number', '')}</code>\n"
         f"🛡️ <b>Status:</b> {status}\n"
-        f"🚩 <b>Reports:</b> {u['reports_count']}\n"
-        f"📍 <b>Location:</b> {u['city']}, {u['state']}\n"
-        f"🚻 <b>Gender:</b> {u['gender']} | 🎯 <b>Seeking:</b> {u['target_gender']}\n"
-        f"🎯 <b>Goal:</b> {GOAL_LABELS.get(u['dating_goal'], u['dating_goal'])}\n"
+        f"🚩 <b>Reports:</b> {u.get('reports_count', 0)}\n"
+        f"📍 <b>Location:</b> {u.get('city', 'Other')}, {u.get('state', 'India')}\n"
+        f"🚻 <b>Gender:</b> {u.get('gender', '')} | 🎯 <b>Seeking:</b> {u.get('target_gender', 'Everyone')}\n"
+        f"🎯 <b>Goal:</b> {GOAL_LABELS.get(u.get('dating_goal', 'Open'), u.get('dating_goal', 'Open'))}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"❝ {u['bio']} ❞"
+        f"❝ {u.get('bio', '')} ❞"
     )
-    if u["photo_file_id"]:
+    if u.get("photo_file_id"):
         await message.answer_photo(photo=u["photo_file_id"], caption=inspect_text, parse_mode="HTML")
     else:
         await message.answer(inspect_text, parse_mode="HTML")
@@ -1978,7 +2084,7 @@ async def start_web_server():
 async def main():
     await init_db()
     await start_web_server()
-    print("Bot is live with Neon PostgreSQL, Anti-Fake Gestures, Viral Boosts & Render Free Hosting...")
+    print("Bot is live with Neon PostgreSQL, Anti-Fake Gestures, Viral 1-Hour Boosts & Render Free Hosting...")
     await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == "__main__":
