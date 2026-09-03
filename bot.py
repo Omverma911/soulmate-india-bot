@@ -31,8 +31,7 @@ except ImportError:
 # --- CONFIGURATION ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8974109640:AAHNuuHALqJQFteuwMlaXiPjzYEjzzUDO8Q")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8925689319"))
-DATABASE_URL = os.environ.get("DATABASE_URL = os.environ.get("DATABASE_URL", "")
-", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DAILY_SWIPE_LIMIT = 50
 
 logging.basicConfig(level=logging.INFO)
