@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 # Configuration & Environment Variables
 # ---------------------------------------------------------
-BOT_TOKEN = os.environ.get("8974109640:AAHNuuHALqJQFteuwMlaXiPjzYEjzzUDO8Q", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8925689319"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.environ.get("PORT", "10000"))
