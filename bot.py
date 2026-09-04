@@ -1,23 +1,29 @@
+import os
+import sys
 import asyncio
 import logging
-import os
-import random
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime, timezone
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandStart, CommandObject
+
+# Aiogram 3.x imports
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandStart
+from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, KICKED, MEMBER
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
+    InlineKeyboardButton,
     ReplyKeyboardMarkup,
+    KeyboardButton,
     ReplyKeyboardRemove,
+    BotCommand,
+    BotCommandScopeChat
 )
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 
+# Database Drivers
 try:
     import asyncpg
 except ImportError:
@@ -28,2328 +34,1192 @@ try:
 except ImportError:
     aiosqlite = None
 
-# --- CONFIGURATION ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8974109640:AAHNuuHALqJQFteuwMlaXiPjzYEjzzUDO8Q")
+# ---------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------
+# Configuration & Environment Variables
+# ---------------------------------------------------------
+BOT_TOKEN = os.environ.get("8974109640:AAHNuuHALqJQFteuwMlaXiPjzYEjzzUDO8Q", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8925689319"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-DAILY_SWIPE_LIMIT = 50
+PORT = int(os.environ.get("PORT", "10000"))
 
-logging.basicConfig(level=logging.INFO)
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN environment variable is not set!")
+    sys.exit(1)
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-pg_pool: Optional[asyncpg.Pool] = None
+db_pool = None
+sqlite_db_path = "dating_bot.db"
+is_postgres = False
 
-# --- LOCATIONS DATA ---
-INDIA_LOCATIONS = {
-    "Delhi NCR": ["New Delhi", "Noida", "Gurugram", "Faridabad", "Ghaziabad", "Other"],
-    "Maharashtra": ["Mumbai", "Pune", "Nagpur", "Nashik", "Thane", "Navi Mumbai", "Other"],
-    "Karnataka": ["Bengaluru", "Mysuru", "Hubballi", "Mangaluru", "Belagavi", "Other"],
-    "Tamil Nadu": ["Chennai", "Coimbatore", "Madurai", "Tiruchirappalli", "Salem", "Other"],
-    "Telangana": ["Hyderabad", "Warangal", "Nizamabad", "Karimnagar", "Other"],
-    "Uttar Pradesh": ["Lucknow", "Kanpur", "Varanasi", "Agra", "Prayagraj", "Meerut", "Other"],
-    "Gujarat": ["Ahmedabad", "Surat", "Vadodara", "Rajkot", "Gandhinagar", "Other"],
-    "West Bengal": ["Kolkata", "Howrah", "Durgapur", "Siliguri", "Asansol", "Other"],
-    "Rajasthan": ["Jaipur", "Jodhpur", "Udaipur", "Kota", "Bikaner", "Other"],
-    "Madhya Pradesh": ["Indore", "Bhopal", "Gwalior", "Jabalpur", "Ujjain", "Other"],
-    "Bihar": ["Patna", "Gaya", "Bhagalpur", "Muzaffarpur", "Darbhanga", "Other"],
-    "Jharkhand": ["Ranchi", "Jamshedpur", "Dhanbad", "Bokaro", "Deoghar", "Other"],
-    "Kerala": ["Kochi", "Thiruvananthapuram", "Kozhikode", "Thrissur", "Other"],
-    "Punjab": ["Ludhiana", "Amritsar", "Jalandhar", "Patiala", "Mohali", "Other"],
-    "Haryana": ["Gurugram", "Faridabad", "Panipat", "Ambala", "Karnal", "Other"],
-    "Chandigarh": ["Chandigarh", "Panchkula", "Mohali", "Other"],
-    "Goa": ["Panaji", "Margao", "Vasco da Gama", "Mapusa", "Other"],
-    "Odisha": ["Bhubaneswar", "Cuttack", "Rourkela", "Puri", "Other"],
-    "Assam & NE": ["Guwahati", "Shillong", "Silchar", "Dibrugarh", "Imphal", "Other"],
-    "Uttarakhand & HP": ["Dehradun", "Rishikesh", "Shimla", "Dharamshala", "Other"],
-    "Jammu & Kashmir": ["Srinagar", "Jammu", "Other"],
-    "Andhra Pradesh": ["Visakhapatnam", "Vijayawada", "Guntur", "Tirupati", "Other"]
-}
+# ---------------------------------------------------------
+# Database Layer (Unified for PostgreSQL & SQLite)
+# ---------------------------------------------------------
+async def init_db():
+    global db_pool, is_postgres
 
-GOAL_OPTIONS = {
-    "💍 Long-Term / True Love": "Long-Term",
-    "🥂 Casual Dating / Hookups": "Casual",
-    "☕ Dates & Explore": "Open",
-    "🤝 New Friends": "Friends"
-}
+    pg_url = DATABASE_URL
+    if pg_url.startswith("postgres://"):
+        pg_url = pg_url.replace("postgres://", "postgresql://", 1)
 
-GOAL_LABELS = {
-    "Long-Term": "💍 Long-Term / True Love",
-    "Casual": "🥂 Casual Dating / Hookups",
-    "Open": "☕ Dates & Explore",
-    "Friends": "🤝 New Friends"
-}
-
-ICEBREAKER_PROMPTS = [
-    "My ideal Sunday looks like...",
-    "A non-negotiable for me in a partner is...",
-    "The quickest way to my heart is...",
-    "Two truths and a lie about me..."
-]
-
-GESTURES = [
-    "✌️ Hold up a PEACE SIGN (2 fingers)",
-    "👍 Hold up a THUMBS UP",
-    "☝️ Point ONE FINGER upwards",
-    "🖐️ Hold up an OPEN PALM (5 fingers)"
-]
-
-# --- DATABASE WRAPPER ---
-async def db_execute(query: str, *params):
-    if pg_pool:
-        parts = query.split("?")
-        pg_query = parts[0]
-        for i in range(1, len(parts)):
-            pg_query += f"${i}" + parts[i]
-        async with pg_pool.acquire() as conn:
-            return await conn.execute(pg_query, *params)
+    if pg_url and asyncpg:
+        logger.info("Connecting to Neon PostgreSQL...")
+        try:
+            db_pool = await asyncpg.create_pool(
+                dsn=pg_url,
+                min_size=1,
+                max_size=10,
+                ssl="require" if "neon.tech" in pg_url else None
+            )
+            is_postgres = True
+            logger.info("✅ SUCCESS: Connected to Neon PostgreSQL and initialized schema!")
+        except Exception as e:
+            logger.error(f"❌ Failed to connect to Neon PostgreSQL: {e}")
+            logger.warning("Falling back to local SQLite storage...")
+            is_postgres = False
     else:
-        async with aiosqlite.connect("dating_bot.db") as db:
-            await db.execute(query, params)
+        if not asyncpg:
+            logger.warning("⚠️ asyncpg library is not installed! Falling back to SQLite.")
+        logger.info(f"Using local SQLite storage ({sqlite_db_path})...")
+        is_postgres = False
+
+    # Create Tables
+    if is_postgres:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    full_name TEXT,
+                    username TEXT,
+                    age INT,
+                    gender TEXT,
+                    target_gender TEXT,
+                    city TEXT,
+                    bio TEXT,
+                    photo_id TEXT,
+                    gesture_photo_id TEXT,
+                    is_verified INT DEFAULT 0,
+                    is_approved INT DEFAULT 0,
+                    is_banned INT DEFAULT 0,
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS pending_registrations (
+                    telegram_id BIGINT PRIMARY KEY,
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS swipes (
+                    id SERIAL PRIMARY KEY,
+                    swiper_id BIGINT,
+                    swiped_id BIGINT,
+                    action TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(swiper_id, swiped_id)
+                );
+                CREATE TABLE IF NOT EXISTS matches (
+                    id SERIAL PRIMARY KEY,
+                    user1_id BIGINT,
+                    user2_id BIGINT,
+                    matched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user1_id, user2_id)
+                );
+                CREATE TABLE IF NOT EXISTS feedback (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    feedback_text TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS reports (
+                    id SERIAL PRIMARY KEY,
+                    reporter_id BIGINT,
+                    reported_id BIGINT,
+                    reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+    else:
+        async with aiosqlite.connect(sqlite_db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id INTEGER PRIMARY KEY,
+                    full_name TEXT,
+                    username TEXT,
+                    age INTEGER,
+                    gender TEXT,
+                    target_gender TEXT,
+                    city TEXT,
+                    bio TEXT,
+                    photo_id TEXT,
+                    gesture_photo_id TEXT,
+                    is_verified INTEGER DEFAULT 0,
+                    is_approved INTEGER DEFAULT 0,
+                    is_banned INTEGER DEFAULT 0,
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS pending_registrations (
+                    telegram_id INTEGER PRIMARY KEY,
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS swipes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    swiper_id INTEGER,
+                    swiped_id INTEGER,
+                    action TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(swiper_id, swiped_id)
+                );
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS matches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user1_id INTEGER,
+                    user2_id INTEGER,
+                    matched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user1_id, user2_id)
+                );
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    feedback_text TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reporter_id INTEGER,
+                    reported_id INTEGER,
+                    reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
             await db.commit()
 
-async def db_fetchrow(query: str, *params):
-    if pg_pool:
+async def db_execute(query: str, *args):
+    """Executes query using '?' parameter placeholders."""
+    if is_postgres:
         parts = query.split("?")
         pg_query = parts[0]
-        for i in range(1, len(parts)):
-            pg_query += f"${i}" + parts[i]
-        async with pg_pool.acquire() as conn:
-            row = await conn.fetchrow(pg_query, *params)
-            return dict(row) if row else None
+        for i, part in enumerate(parts[1:], 1):
+            pg_query += f"${i}{part}"
+        async with db_pool.acquire() as conn:
+            return await conn.execute(pg_query, *args)
     else:
-        async with aiosqlite.connect("dating_bot.db") as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(query, params)
-            row = await cursor.fetchone()
-            return dict(row) if row else None
+        async with aiosqlite.connect(sqlite_db_path) as db:
+            await db.execute(query, args)
+            await db.commit()
 
-async def db_fetchall(query: str, *params):
-    if pg_pool:
+async def db_query(query: str, *args):
+    """Executes SELECT query and returns rows as dictionaries."""
+    if is_postgres:
         parts = query.split("?")
         pg_query = parts[0]
-        for i in range(1, len(parts)):
-            pg_query += f"${i}" + parts[i]
-        async with pg_pool.acquire() as conn:
-            rows = await conn.fetch(pg_query, *params)
+        for i, part in enumerate(parts[1:], 1):
+            pg_query += f"${i}{part}"
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(pg_query, *args)
             return [dict(r) for r in rows]
     else:
-        async with aiosqlite.connect("dating_bot.db") as db:
+        async with aiosqlite.connect(sqlite_db_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute(query, params)
+            cursor = await db.execute(query, args)
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
-async def db_fetchval(query: str, *params):
-    if pg_pool:
-        parts = query.split("?")
-        pg_query = parts[0]
-        for i in range(1, len(parts)):
-            pg_query += f"${i}" + parts[i]
-        async with pg_pool.acquire() as conn:
-            return await conn.fetchval(pg_query, *params)
-    else:
-        async with aiosqlite.connect("dating_bot.db") as db:
-            cursor = await db.execute(query, params)
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+# ---------------------------------------------------------
+# FSM States
+# ---------------------------------------------------------
+class Registration(StatesGroup):
+    name = State()
+    age = State()
+    gender = State()
+    target_gender = State()
+    city = State()
+    bio = State()
+    photo = State()
+    gesture_selfie = State()
 
-async def init_db():
-    global pg_pool
-    if not DATABASE_URL:
-        logging.warning("⚠️ DATABASE_URL is empty! Falling back to local SQLite.")
-    elif asyncpg is None:
-        logging.warning("⚠️ asyncpg library is not installed! Falling back to SQLite.")
-    else:
-        try:
-            clean_url = DATABASE_URL
-            if clean_url.startswith("postgres://"):
-                clean_url = clean_url.replace("postgres://", "postgresql://", 1)
-            
-            logging.info("Connecting to Neon PostgreSQL...")
-            pg_pool = await asyncpg.create_pool(clean_url, max_size=10, min_size=1)
+class RetakeSelfie(StatesGroup):
+    waiting_for_photo = State()
 
-            async with pg_pool.acquire() as conn:
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        telegram_id BIGINT PRIMARY KEY,
-                        username TEXT DEFAULT '',
-                        phone_number TEXT DEFAULT '',
-                        name TEXT DEFAULT '',
-                        age INTEGER DEFAULT 18,
-                        gender TEXT DEFAULT '',
-                        target_gender TEXT DEFAULT 'Everyone',
-                        dating_goal TEXT DEFAULT 'Long-Term',
-                        intent_filter TEXT DEFAULT 'flexible',
-                        state TEXT DEFAULT 'India',
-                        city TEXT DEFAULT 'Other',
-                        photo_file_id TEXT DEFAULT '',
-                        selfie_file_id TEXT DEFAULT '',
-                        bio TEXT DEFAULT '',
-                        icebreaker_question TEXT DEFAULT '',
-                        icebreaker_answer TEXT DEFAULT '',
-                        reports_count INTEGER DEFAULT 0,
-                        superlikes_balance INTEGER DEFAULT 1,
-                        boosts_balance INTEGER DEFAULT 1,
-                        last_superlike_date TEXT DEFAULT '',
-                        daily_swipes_count INTEGER DEFAULT 0,
-                        last_swipe_date TEXT DEFAULT '',
-                        boost_expires_at TEXT DEFAULT '',
-                        referred_by BIGINT DEFAULT 0,
-                        search_scope TEXT DEFAULT 'same_city',
-                        is_approved INTEGER DEFAULT 0,
-                        is_verified INTEGER DEFAULT 0,
-                        is_banned INTEGER DEFAULT 0
-                    );
-                    CREATE TABLE IF NOT EXISTS swipes (
-                        swiper_id BIGINT,
-                        target_id BIGINT,
-                        action TEXT,
-                        PRIMARY KEY (swiper_id, target_id)
-                    );
-                    CREATE TABLE IF NOT EXISTS matches (
-                        user1_id BIGINT,
-                        user2_id BIGINT,
-                        user1_shared INTEGER DEFAULT 0,
-                        user2_shared INTEGER DEFAULT 0,
-                        created_at TEXT DEFAULT '',
-                        PRIMARY KEY (user1_id, user2_id)
-                    );
-                    CREATE TABLE IF NOT EXISTS pending_registrations (
-                        telegram_id BIGINT PRIMARY KEY,
-                        created_at TEXT DEFAULT ''
-                    );
-                    UPDATE users SET boosts_balance = 1 WHERE boosts_balance IS NULL;
-                    UPDATE users SET superlikes_balance = 1 WHERE superlikes_balance IS NULL;
-                    UPDATE users SET boost_expires_at = '' WHERE boost_expires_at IS NULL;
-                """)
-            logging.info("✅ SUCCESS: Connected to Neon PostgreSQL and initialized schema!")
-            return
-        except Exception as e:
-            logging.error(f"❌ Failed to connect to Neon PostgreSQL: {e}")
-            logging.warning("Falling back to local SQLite storage...")
+class FeedbackStates(StatesGroup):
+    waiting_for_feedback = State()
 
-    # Fallback SQLite Initializer
-    logging.info("Using local SQLite storage (dating_bot.db)...")
-    async with aiosqlite.connect("dating_bot.db") as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
-                username TEXT DEFAULT '',
-                phone_number TEXT DEFAULT '',
-                name TEXT DEFAULT '',
-                age INTEGER DEFAULT 18,
-                gender TEXT DEFAULT '',
-                target_gender TEXT DEFAULT 'Everyone',
-                dating_goal TEXT DEFAULT 'Long-Term',
-                intent_filter TEXT DEFAULT 'flexible',
-                state TEXT DEFAULT 'India',
-                city TEXT DEFAULT 'Other',
-                photo_file_id TEXT DEFAULT '',
-                selfie_file_id TEXT DEFAULT '',
-                bio TEXT DEFAULT '',
-                icebreaker_question TEXT DEFAULT '',
-                icebreaker_answer TEXT DEFAULT '',
-                reports_count INTEGER DEFAULT 0,
-                superlikes_balance INTEGER DEFAULT 1,
-                boosts_balance INTEGER DEFAULT 1,
-                last_superlike_date TEXT DEFAULT '',
-                daily_swipes_count INTEGER DEFAULT 0,
-                last_swipe_date TEXT DEFAULT '',
-                boost_expires_at TEXT DEFAULT '',
-                referred_by INTEGER DEFAULT 0,
-                search_scope TEXT DEFAULT 'same_city',
-                is_approved INTEGER DEFAULT 0,
-                is_verified INTEGER DEFAULT 0,
-                is_banned INTEGER DEFAULT 0
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS swipes (
-                swiper_id INTEGER,
-                target_id INTEGER,
-                action TEXT,
-                PRIMARY KEY (swiper_id, target_id)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS matches (
-                user1_id INTEGER,
-                user2_id INTEGER,
-                user1_shared INTEGER DEFAULT 0,
-                user2_shared INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT '',
-                PRIMARY KEY (user1_id, user2_id)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS pending_registrations (
-                telegram_id INTEGER PRIMARY KEY,
-                created_at TEXT DEFAULT ''
-            )
-        """)
-        await db.commit()
+class AdminReplyState(StatesGroup):
+    waiting_for_reply = State()
 
-# --- UI HELPERS ---
-async def get_main_menu(user_id: int):
-    count = await db_fetchval("""
-        SELECT COUNT(*) FROM swipes s
-        WHERE s.target_id = ? AND s.action = 'like'
-          AND s.swiper_id NOT IN (SELECT target_id FROM swipes WHERE swiper_id = ?)
-    """, user_id, user_id)
-
-    likes_btn_text = f"💌 Likes Received ({count})" if count > 0 else "💌 Likes Received"
+# ---------------------------------------------------------
+# Keyboards & Helpers
+# ---------------------------------------------------------
+def main_menu_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔍 Discover"), KeyboardButton(text=likes_btn_text)],
-            [KeyboardButton(text="👥 My Matches"), KeyboardButton(text="👤 My Profile")],
-            [KeyboardButton(text="🎁 Invite & Boost"), KeyboardButton(text="📜 My History")],
-            [KeyboardButton(text="⚙️ Preferences")]
+            [KeyboardButton(text="🔍 Discover Matches")],
+            [KeyboardButton(text="👤 My Profile"), KeyboardButton(text="💌 Matches")],
+            [KeyboardButton(text="💬 Feedback")]
         ],
         resize_keyboard=True
     )
 
-def get_states_keyboard(prefix="state_"):
-    buttons = []
-    row = []
-    for state in INDIA_LOCATIONS.keys():
-        row.append(InlineKeyboardButton(text=state, callback_data=f"{prefix}{state}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def safe_user_mention(user_id: int, full_name: str, username: str = None) -> str:
+    if username:
+        return f"@{username}"
+    return f'<a href="tg://user?id={user_id}">{full_name}</a>'
 
-def get_cities_keyboard(state_name, prefix="city_"):
-    cities = INDIA_LOCATIONS.get(state_name, ["Other"])
-    buttons = []
-    row = []
-    for city in cities:
-        row.append(InlineKeyboardButton(text=city, callback_data=f"{prefix}{city}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+# ---------------------------------------------------------
+# Lifecycle Handlers (Soft Hide On Block / Restore On Return)
+# ---------------------------------------------------------
+@dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=KICKED))
+async def handle_user_blocked(event: types.ChatMemberUpdated):
+    user_id = event.from_user.id
+    logger.info(f"🚫 User {user_id} blocked bot. Soft-hiding profile.")
+    await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", user_id)
 
-# --- FSM STATES ---
-class Registration(StatesGroup):
-    name = State()
-    phone = State()
-    age = State()
-    gender = State()
-    target_gender = State()
-    dating_goal = State()
-    state_select = State()
-    city_select = State()
-    photo = State()
-    selfie_verification = State()
-    icebreaker_choice = State()
-    icebreaker_text = State()
-    bio = State()
+@dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
+async def handle_user_unblocked(event: types.ChatMemberUpdated):
+    user_id = event.from_user.id
+    logger.info(f"✨ User {user_id} unblocked bot.")
+    await db_execute("UPDATE users SET is_approved = 1 WHERE telegram_id = ? AND is_verified = 1 AND is_banned = 0", user_id)
 
-class ReVerification(StatesGroup):
-    waiting_for_new_selfie = State()
+# ---------------------------------------------------------
+# User Registration Flow
+# ---------------------------------------------------------
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    users = await db_query("SELECT * FROM users WHERE telegram_id = ?", user_id)
 
-class EditProfile(StatesGroup):
-    edit_bio = State()
-    edit_photo = State()
-    edit_state = State()
-    edit_city = State()
-
-class AdminStates(StatesGroup):
-    broadcast_message = State()
-
-# --- DISCOVERY LOGIC ---
-async def show_next_candidate(chat_id: int, user_id: int):
-    today = datetime.now().strftime("%Y-%m-%d")
-    now_iso = datetime.now().isoformat()
-
-    current_user = await db_fetchrow("SELECT * FROM users WHERE telegram_id = ?", user_id)
-
-    if not current_user:
-        await bot.send_message(chat_id, "Please set up your profile first using /start.")
-        return
-
-    if current_user.get("is_banned", 0) == 1:
-        await bot.send_message(chat_id, "🚫 <b>Your account has been suspended for violating community guidelines.</b>", parse_mode="HTML")
-        return
-
-    if current_user.get("is_approved", 0) == 0:
-        retry_kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="📸 Retake Verification Selfie", callback_data="retry_verification")]]
-        )
-        await bot.send_message(
-            chat_id,
-            "⏳ <b>Your profile is pending manual verification.</b>\n\n"
-            "Our team will review your gesture selfie shortly. If your previous submission was unclear, tap below to submit a new one.",
-            reply_markup=retry_kb,
-            parse_mode="HTML"
-        )
-        return
-
-    last_date = current_user.get("last_swipe_date", "") or ""
-    swipes_used = current_user.get("daily_swipes_count", 0) if last_date == today else 0
-
-    if swipes_used >= DAILY_SWIPE_LIMIT and current_user["telegram_id"] != ADMIN_ID:
-        limit_msg = (
-            f"🛑 <b>Daily Swipe Limit Reached ({DAILY_SWIPE_LIMIT}/{DAILY_SWIPE_LIMIT})</b>\n\n"
-            f"Your limit resets at midnight! Want more swipes and free Super Likes?\n"
-            f"Tap <b>🎁 Invite & Boost</b> to earn rewards!"
-        )
-        menu = await get_main_menu(user_id)
-        await bot.send_message(chat_id, limit_msg, reply_markup=menu, parse_mode="HTML")
-        return
-
-    search_scope = current_user.get("search_scope", "same_city") or "same_city"
-    intent_filter = current_user.get("intent_filter", "flexible") or "flexible"
-    user_goal = current_user.get("dating_goal", "Long-Term") or "Long-Term"
-
-    query = """
-        SELECT *, (CASE WHEN boost_expires_at > ? THEN 1 ELSE 0 END) AS is_boosted
-        FROM users 
-        WHERE telegram_id != ?
-          AND reports_count < 3
-          AND is_banned = 0
-          AND is_approved = 1
-          AND telegram_id NOT IN (SELECT target_id FROM swipes WHERE swiper_id = ?)
-    """
-    params = [now_iso, user_id, user_id]
-
-    if current_user["target_gender"] != "Everyone":
-        query += " AND gender = ?"
-        params.append(current_user["target_gender"])
-
-    if intent_filter == "strict":
-        if user_goal == "Long-Term":
-            query += " AND dating_goal IN ('Long-Term', 'Open')"
-        elif user_goal == "Casual":
-            query += " AND dating_goal IN ('Casual', 'Open')"
-        elif user_goal == "Friends":
-            query += " AND dating_goal IN ('Friends', 'Open')"
-
-    if search_scope == "same_city":
-        query += " AND city = ? ORDER BY is_boosted DESC, RANDOM() LIMIT 1"
-        params.append(current_user["city"])
-    else:
-        query += " ORDER BY is_boosted DESC, (city = ?) DESC, RANDOM() LIMIT 1"
-        params.append(current_user["city"])
-
-    candidate = await db_fetchrow(query, *params)
-
-    if not candidate:
-        scope_msg = (
-            f"No more matching profiles in <b>{current_user.get('city', 'Other')}</b> right now.\n"
-            f"Tip: Try switching to <b>🇮🇳 All India</b> or <b>🌐 All Goals</b> in <b>⚙️ Preferences</b>!"
-            if search_scope == "same_city"
-            else "You're all caught up for now!\nCheck back soon or explore <b>💌 Likes Received</b>."
-        )
-
-        no_profile_text = f"✨ <b>You're all caught up!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n{scope_msg}"
-        menu = await get_main_menu(user_id)
-        await bot.send_message(chat_id, no_profile_text, reply_markup=menu, parse_mode="HTML")
-        return
-
-    st_str = candidate.get("state", "India") or "India"
-    ct_str = candidate.get("city", "Other") or "Other"
-    cand_goal_label = GOAL_LABELS.get(candidate.get("dating_goal", "Open"), "☕ Dates & Explore")
-    v_badge = " ✅ [Verified]" if candidate.get("is_verified", 0) == 1 else ""
-    boost_badge = " 🚀 [Spotlight #1]" if candidate.get("is_boosted", 0) == 1 else ""
-
-    icebreaker_section = ""
-    if candidate.get("icebreaker_question") and candidate.get("icebreaker_answer"):
-        icebreaker_section = (
-            f"\n💡 <i>{candidate['icebreaker_question']}</i>\n"
-            f"👉 <b>{candidate['icebreaker_answer']}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━"
-        )
-
-    card_text = (
-        f"👤 <b>{candidate['name'].upper()}</b>{v_badge}{boost_badge}, {candidate['age']}\n"
-        f"📍 <i>{ct_str}, {st_str}</i>\n"
-        f"🎯 <b>Goal:</b> {cand_goal_label}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"❝ {candidate['bio']} ❞\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
-        f"{icebreaker_section}"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✕ Pass", callback_data=f"swipe_pass_{candidate['telegram_id']}"),
-                InlineKeyboardButton(text="⭐ Super Like", callback_data=f"swipe_super_{candidate['telegram_id']}"),
-                InlineKeyboardButton(text="♥ Like", callback_data=f"swipe_like_{candidate['telegram_id']}")
-            ],
-            [
-                InlineKeyboardButton(text="🚩 Report Profile", callback_data=f"report_{candidate['telegram_id']}")
-            ]
-        ]
-    )
-
-    await bot.send_photo(
-        chat_id=chat_id,
-        photo=candidate["photo_file_id"],
-        caption=card_text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-
-# --- ONBOARDING FLOW ---
-@dp.message(CommandStart(deep_link=True))
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext, command: CommandObject = None):
-    await state.clear()
-    uid = message.from_user.id
-
-    referrer_id = 0
-    if command and command.args and command.args.startswith("ref_"):
-        try:
-            referrer_id = int(command.args.replace("ref_", ""))
-            if referrer_id == uid:
-                referrer_id = 0
-        except Exception:
-            referrer_id = 0
-
-    user = await db_fetchrow("SELECT * FROM users WHERE telegram_id = ?", uid)
-
-    if user:
-        if user.get("is_banned", 0) == 1:
-            await message.answer("🚫 <b>Your account is suspended for community guideline violations.</b>", parse_mode="HTML")
+    if users:
+        user = users[0]
+        if user["is_banned"]:
+            await message.answer("🚫 Your account has been suspended by administration.")
             return
         
-        if user.get("is_approved", 0) == 0:
-            retry_kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="📸 Retake Verification Selfie", callback_data="retry_verification")]]
-            )
-            await message.answer(
-                f"<b>Welcome back, {user['name']}!</b>\n\n"
-                "⏳ <i>Your profile is currently waiting for admin manual verification.</i>\n"
-                "If your previous selfie was unclear, tap below to submit a new one:",
-                reply_markup=retry_kb,
-                parse_mode="HTML"
-            )
-            return
+        if not user["is_approved"] and user["is_verified"]:
+            await db_execute("UPDATE users SET is_approved = 1 WHERE telegram_id = ?", user_id)
 
-        welcome_back_text = (
-            f"<b>Welcome back, {user['name']}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Explore verified matches, review likes, swipe history, or invite friends."
+        await message.answer(
+            f"👋 Welcome back, {user['full_name']}!\nReady to meet matches in {user['city']}?",
+            reply_markup=main_menu_keyboard()
         )
-        menu = await get_main_menu(uid)
-        await message.answer(welcome_back_text, reply_markup=menu, parse_mode="HTML")
-    else:
-        # Track pending registration start for completion reminders
-        today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        await db_execute(
-            "INSERT INTO pending_registrations (telegram_id, created_at) VALUES (?, ?) ON CONFLICT (telegram_id) DO NOTHING",
-            uid, today_str
-        )
+        return
 
-        await state.update_data(referred_by=referrer_id)
-        intro_text = (
-            f"✨ <b>Welcome to Soulmate India</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"A curated, private space for authentic connections.\n\n"
-            f"<b>What is your first name?</b>"
-        )
-        await message.answer(intro_text, reply_markup=ReplyKeyboardRemove(), parse_mode="HTML")
-        await state.set_state(Registration.name)
+    await db_execute(
+        "INSERT INTO pending_registrations (telegram_id) VALUES (?) ON CONFLICT DO NOTHING",
+        user_id
+    )
+
+    await state.set_state(Registration.name)
+    await message.answer(
+        "✨ <b>Welcome to Soulmate India 💌</b>\n\n"
+        "Let's create your dating profile in a few simple steps.\n"
+        "What is your full name?",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
 
 @dp.message(Registration.name)
 async def process_name(message: types.Message, state: FSMContext):
-    name = message.text.strip().title()
-    await state.update_data(name=name)
-
-    contact_btn = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Share Mobile Number to Verify", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    await message.answer(
-        f"Pleasure to meet you, <b>{name}</b>.\n\nPlease share your mobile number to verify your profile:",
-        reply_markup=contact_btn,
-        parse_mode="HTML"
-    )
-    await state.set_state(Registration.phone)
-
-@dp.message(Registration.phone, F.contact)
-async def process_phone(message: types.Message, state: FSMContext):
-    phone_number = message.contact.phone_number
-    await state.update_data(phone_number=phone_number)
-    await message.answer("How old are you? (Must be 18+)", reply_markup=ReplyKeyboardRemove())
+    await state.update_data(full_name=message.text.strip())
     await state.set_state(Registration.age)
-
-@dp.message(Registration.phone)
-async def process_phone_invalid(message: types.Message):
-    contact_btn = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Share Mobile Number to Verify", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    await message.answer("Please tap the button below to share your verified mobile number:", reply_markup=contact_btn)
+    await message.answer("Great! How old are you? (Enter a number between 18 and 99)")
 
 @dp.message(Registration.age)
 async def process_age(message: types.Message, state: FSMContext):
-    if not message.text.isdigit() or int(message.text) < 18 or int(message.text) > 99:
-        await message.answer("⚠️ Please enter a valid numerical age between 18 and 99.")
+    if not message.text.isdigit() or not (18 <= int(message.text) <= 99):
+        await message.answer("⚠️ Please enter a valid age between 18 and 99.")
         return
-
     await state.update_data(age=int(message.text))
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Man"), KeyboardButton(text="Woman")],
-            [KeyboardButton(text="Non-Binary / Other")]
-        ],
+    await state.set_state(Registration.gender)
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Male"), KeyboardButton(text="Female")]],
         resize_keyboard=True,
         one_time_keyboard=True
     )
-    await message.answer("<b>Select your gender:</b>", reply_markup=keyboard, parse_mode="HTML")
-    await state.set_state(Registration.gender)
+    await message.answer("What is your gender?", reply_markup=kb)
 
 @dp.message(Registration.gender)
 async def process_gender(message: types.Message, state: FSMContext):
-    gender_map = {"Man": "Male", "Woman": "Female", "Non-Binary / Other": "Other"}
-    selected = gender_map.get(message.text, message.text)
-    
-    if selected not in ["Male", "Female", "Other"]:
-        await message.answer("Please select an option using the keyboard.")
+    if message.text not in ["Male", "Female"]:
+        await message.answer("Please choose an option from the buttons below.")
         return
-
-    await state.update_data(gender=selected)
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Men"), KeyboardButton(text="Women")],
-            [KeyboardButton(text="Everyone")]
-        ],
+    await state.update_data(gender=message.text)
+    await state.set_state(Registration.target_gender)
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Female"), KeyboardButton(text="Male"), KeyboardButton(text="Everyone")]],
         resize_keyboard=True,
         one_time_keyboard=True
     )
-    await message.answer("<b>Who are you interested in meeting?</b>", reply_markup=keyboard, parse_mode="HTML")
-    await state.set_state(Registration.target_gender)
+    await message.answer("Who are you interested in meeting?", reply_markup=kb)
 
 @dp.message(Registration.target_gender)
 async def process_target_gender(message: types.Message, state: FSMContext):
-    target_map = {"Men": "Male", "Women": "Female", "Everyone": "Everyone"}
-    selected = target_map.get(message.text, message.text)
+    await state.update_data(target_gender=message.text)
+    await state.set_state(Registration.city)
+    await message.answer("Which city are you located in?", reply_markup=ReplyKeyboardRemove())
 
-    if selected not in ["Male", "Female", "Everyone"]:
-        await message.answer("Please select an option using the keyboard.")
-        return
+@dp.message(Registration.city)
+async def process_city(message: types.Message, state: FSMContext):
+    await state.update_data(city=message.text.strip().title())
+    await state.set_state(Registration.bio)
+    await message.answer("Write a short bio about yourself (interests, hobbies, what you are looking for):")
 
-    await state.update_data(target_gender=selected)
-
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="💍 Long-Term / True Love"), KeyboardButton(text="🥂 Casual Dating / Hookups")],
-            [KeyboardButton(text="☕ Dates & Explore"), KeyboardButton(text="🤝 New Friends")]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    await message.answer("🎯 <b>What are you looking for on this platform?</b>", reply_markup=keyboard, parse_mode="HTML")
-    await state.set_state(Registration.dating_goal)
-
-@dp.message(Registration.dating_goal)
-async def process_dating_goal(message: types.Message, state: FSMContext):
-    goal_key = GOAL_OPTIONS.get(message.text, "Open")
-    await state.update_data(dating_goal=goal_key)
-
-    await message.answer("📍 <b>Select your State / Region:</b>", reply_markup=get_states_keyboard(), parse_mode="HTML")
-    await state.set_state(Registration.state_select)
-
-@dp.callback_query(Registration.state_select, F.data.startswith("state_"))
-async def process_state_callback(callback: types.CallbackQuery, state: FSMContext):
-    selected_state = callback.data.replace("state_", "")
-    await state.update_data(state=selected_state)
-    
-    await callback.message.edit_text(
-        f"📍 Region: <b>{selected_state}</b>\n\n<b>Select your city:</b>",
-        reply_markup=get_cities_keyboard(selected_state),
-        parse_mode="HTML"
-    )
-    await state.set_state(Registration.city_select)
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-
-@dp.callback_query(Registration.city_select, F.data.startswith("city_"))
-async def process_city_callback(callback: types.CallbackQuery, state: FSMContext):
-    selected_city = callback.data.replace("city_", "")
-    await state.update_data(city=selected_city)
-    
-    await callback.message.edit_text(f"📍 Location set: <b>{selected_city}</b>", parse_mode="HTML")
-    await callback.message.answer(
-        "📸 <b>Upload your MAIN portrait photo:</b>\n<i>(This will be visible on your public card)</i>",
-        reply_markup=ReplyKeyboardRemove(),
-        parse_mode="HTML"
-    )
+@dp.message(Registration.bio)
+async def process_bio(message: types.Message, state: FSMContext):
+    await state.update_data(bio=message.text.strip())
     await state.set_state(Registration.photo)
-    try:
-        await callback.answer()
-    except Exception:
-        pass
+    await message.answer("📸 Please upload your primary profile picture:")
 
 @dp.message(Registration.photo, F.photo)
 async def process_photo(message: types.Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
-    await state.update_data(photo_file_id=photo_id)
-
-    chosen_gesture = random.choice(GESTURES)
-    await state.update_data(required_gesture=chosen_gesture)
-
-    gesture_text = (
-        f"🛡️ <b>ANTI-FAKE PROFILE VERIFICATION</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"To verify you are real and keep bots out, take a quick selfie holding this pose:\n\n"
-        f"👉 <b>{chosen_gesture}</b>\n\n"
-        f"<i>Note: This selfie is strictly for admin moderation and will NEVER be shown publicly.</i>"
+    await state.update_data(photo_id=photo_id)
+    await state.set_state(Registration.gesture_selfie)
+    await message.answer(
+        "✌️ <b>Anti-Fake Verification Step</b>\n\n"
+        "To keep our community safe from catfishes, upload a quick selfie holding up a <b>Peace Sign (✌️)</b>.\n"
+        "<i>This photo is reviewed strictly by moderators and will NOT be shown on your profile.</i>",
+        parse_mode="HTML"
     )
-    await message.answer(gesture_text, parse_mode="HTML")
-    await state.set_state(Registration.selfie_verification)
 
-@dp.message(Registration.selfie_verification, F.photo)
-async def process_selfie_verification(message: types.Message, state: FSMContext):
-    selfie_id = message.photo[-1].file_id
-    await state.update_data(selfie_file_id=selfie_id)
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=f"💬 {p[:28]}...", callback_data=f"ice_{i}")] for i, p in enumerate(ICEBREAKER_PROMPTS)]
-    )
-    await message.answer("💡 <b>Choose an Icebreaker Question to add to your profile:</b>", reply_markup=kb, parse_mode="HTML")
-    await state.set_state(Registration.icebreaker_choice)
-
-@dp.callback_query(Registration.icebreaker_choice, F.data.startswith("ice_"))
-async def process_icebreaker_choice(callback: types.CallbackQuery, state: FSMContext):
-    idx = int(callback.data.replace("ice_", ""))
-    chosen_prompt = ICEBREAKER_PROMPTS[idx]
-    await state.update_data(icebreaker_question=chosen_prompt)
-
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-
-    await callback.message.edit_text(f"💡 Prompt: <b>{chosen_prompt}</b>\n\n✍️ <b>Type your answer:</b>", parse_mode="HTML")
-    await state.set_state(Registration.icebreaker_text)
-
-@dp.message(Registration.icebreaker_text)
-async def process_icebreaker_text(message: types.Message, state: FSMContext):
-    await state.update_data(icebreaker_answer=message.text.strip())
-    await message.answer("✍️ <b>Almost done! Introduce yourself with a short bio:</b>", parse_mode="HTML")
-    await state.set_state(Registration.bio)
-
-@dp.message(Registration.bio)
-async def process_bio(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    bio = message.text.strip()
+@dp.message(Registration.gesture_selfie, F.photo)
+async def process_gesture_selfie(message: types.Message, state: FSMContext):
+    gesture_photo_id = message.photo[-1].file_id
+    data = await state.get_data()
+    user_id = message.from_user.id
     username = message.from_user.username or ""
-    uid = message.from_user.id
-    name = user_data.get("name", "Member")
-    age = user_data.get("age", 18)
-    gender = user_data.get("gender", "Male")
-    tgt_gender = user_data.get("target_gender", "Everyone")
-    goal = user_data.get("dating_goal", "Long-Term")
-    state_val = user_data.get("state", "India")
-    city_val = user_data.get("city", "Other")
-    photo_file_id = user_data.get("photo_file_id", "")
-    selfie_file_id = user_data.get("selfie_file_id", "")
-    phone = user_data.get("phone_number", "")
-    gesture = user_data.get("required_gesture", "Gesture Pose")
-    ice_q = user_data.get("icebreaker_question", "")
-    ice_a = user_data.get("icebreaker_answer", "")
-    ref_by = user_data.get("referred_by", 0)
 
-    is_approved_val = 1 if uid == ADMIN_ID else 0
-    is_verified_val = 1 if uid == ADMIN_ID else 0
-
-    # Safe Upsert (Preserves data idempotently without duplicate errors)
     await db_execute("""
-        INSERT INTO users 
-        (telegram_id, username, phone_number, name, age, gender, target_gender, dating_goal, intent_filter, state, city, photo_file_id, selfie_file_id, bio, icebreaker_question, icebreaker_answer, reports_count, superlikes_balance, boosts_balance, last_superlike_date, daily_swipes_count, last_swipe_date, boost_expires_at, referred_by, search_scope, is_approved, is_verified, is_banned)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'flexible', ?, ?, ?, ?, ?, ?, ?, 0, 1, 1, '', 0, '', '', ?, 'same_city', ?, ?, 0)
+        INSERT INTO users (
+            telegram_id, full_name, username, age, gender, target_gender,
+            city, bio, photo_id, gesture_photo_id, is_verified, is_approved, is_banned
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)
         ON CONFLICT (telegram_id) DO UPDATE SET
+            full_name = EXCLUDED.full_name,
             username = EXCLUDED.username,
-            phone_number = EXCLUDED.phone_number,
-            name = EXCLUDED.name,
             age = EXCLUDED.age,
             gender = EXCLUDED.gender,
             target_gender = EXCLUDED.target_gender,
-            dating_goal = EXCLUDED.dating_goal,
-            state = EXCLUDED.state,
             city = EXCLUDED.city,
-            photo_file_id = EXCLUDED.photo_file_id,
-            selfie_file_id = EXCLUDED.selfie_file_id,
             bio = EXCLUDED.bio,
-            icebreaker_question = EXCLUDED.icebreaker_question,
-            icebreaker_answer = EXCLUDED.icebreaker_answer,
-            is_approved = EXCLUDED.is_approved,
-            is_verified = EXCLUDED.is_verified,
-            is_banned = 0
-    """, uid, username, phone, name, age, gender, tgt_gender, goal, state_val, city_val, photo_file_id, selfie_file_id, bio, ice_q, ice_a, ref_by, is_approved_val, is_verified_val)
+            photo_id = EXCLUDED.photo_id,
+            gesture_photo_id = EXCLUDED.gesture_photo_id,
+            is_verified = 0,
+            is_approved = 0
+    """, user_id, data['full_name'], username, data['age'], data['gender'],
+       data['target_gender'], data['city'], data['bio'], data['photo_id'], gesture_photo_id)
 
-    # Remove from pending registrations tracker
-    await db_execute("DELETE FROM pending_registrations WHERE telegram_id = ?", uid)
-
-    if ref_by and ref_by != uid:
-        await db_execute("""
-            UPDATE users 
-            SET superlikes_balance = COALESCE(superlikes_balance, 0) + 3,
-                boosts_balance = COALESCE(boosts_balance, 0) + 1
-            WHERE telegram_id = ?
-        """, ref_by)
-
-        try:
-            await bot.send_message(
-                ref_by,
-                f"🎁 <b>REFERRAL REWARD UNLOCKED!</b>\n\n"
-                f"Your friend <b>{name}</b> just joined using your link!\n"
-                f"• ⭐ <b>+3 Super Likes</b> added\n"
-                f"• 🚀 <b>+1 Spotlight Boost (1-Hour Duration)</b> added to your inventory!\n\n"
-                f"Tap <b>👤 My Profile</b> whenever you want to activate your 1-hour boost!",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-    await state.clear()
-    menu = await get_main_menu(uid)
-
-    if uid == ADMIN_ID:
-        await message.answer("🎉 <b>Admin Profile setup complete!</b> (Auto-Verified & Active)", reply_markup=menu, parse_mode="HTML")
-    else:
-        await message.answer(
-            "🎉 <b>Profile & Gesture Selfie submitted!</b>\n\n"
-            "⏳ <i>Your profile is now under manual verification by our moderation team. You will be notified immediately once approved!</i>",
-            reply_markup=menu,
-            parse_mode="HTML"
-        )
-
-        if ADMIN_ID:
-            admin_card = (
-                f"🛡️ <b>NEW VERIFICATION REVIEW REQUEST</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>Name:</b> {name}, {age} ({gender})\n"
-                f"📞 <b>Phone:</b> <code>{phone}</code>\n"
-                f"🆔 <b>Telegram ID:</b> <code>{uid}</code>\n"
-                f"🔗 <b>Username:</b> {('@' + username) if username else 'No public handle'}\n"
-                f"📍 <b>Location:</b> {city_val}, {state_val}\n"
-                f"🎯 <b>Goal:</b> {GOAL_LABELS.get(goal, goal)}\n"
-                f"👉 <b>Assigned Pose:</b> <b>{gesture}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"❝ {bio} ❞\n"
-                f"💡 <i>{ice_q}</i> -> <b>{ice_a}</b>"
-            )
-            admin_kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="✅ Approve & Verify Badge", callback_data=f"adm_approve_{uid}"),
-                        InlineKeyboardButton(text="⚠️ Reject (Allow Retry)", callback_data=f"adm_reject_{uid}")
-                    ],
-                    [
-                        InlineKeyboardButton(text="🚫 Permanent Ban", callback_data=f"adm_ban_{uid}")
-                    ]
-                ]
-            )
-            try:
-                await bot.send_photo(
-                    chat_id=ADMIN_ID,
-                    photo=photo_file_id,
-                    caption=f"🖼️ <b>[1/2 MAIN PROFILE PHOTO]</b>\n{name}, {age} ({city_val})",
-                    parse_mode="HTML"
-                )
-                await bot.send_photo(
-                    chat_id=ADMIN_ID,
-                    photo=selfie_file_id if selfie_file_id else photo_file_id,
-                    caption=f"🤳 <b>[2/2 GESTURE SELFIE REVIEW]</b>\n{admin_card}",
-                    reply_markup=admin_kb,
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logging.warning(f"Failed to alert admin: {e}")
-
-# --- RE-VERIFICATION & RETRY HANDLERS ---
-@dp.callback_query(F.data == "retry_verification")
-async def retry_verification_handler(callback: types.CallbackQuery, state: FSMContext):
-    chosen_gesture = random.choice(GESTURES)
-    await state.update_data(required_gesture=chosen_gesture)
-
-    gesture_text = (
-        f"🛡️ <b>RE-SUBMIT VERIFICATION SELFIE</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Please take a clear selfie holding this pose:\n\n"
-        f"👉 <b>{chosen_gesture}</b>\n\n"
-        f"<i>Make sure your face and hand gesture are clearly visible!</i>"
-    )
-    await callback.message.answer(gesture_text, parse_mode="HTML")
-    await state.set_state(ReVerification.waiting_for_new_selfie)
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-
-@dp.message(ReVerification.waiting_for_new_selfie, F.photo)
-async def process_resubmitted_selfie(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    selfie_id = message.photo[-1].file_id
-    state_data = await state.get_data()
-    gesture = state_data.get("required_gesture", "Gesture Pose")
-
-    await db_execute("UPDATE users SET selfie_file_id = ?, is_approved = 0, is_banned = 0 WHERE telegram_id = ?", selfie_id, user_id)
+    await db_execute("DELETE FROM pending_registrations WHERE telegram_id = ?", user_id)
     await state.clear()
 
     await message.answer(
-        "✅ <b>New verification selfie submitted!</b>\n"
-        "Our moderation team has received it and will review it shortly.",
-        parse_mode="HTML"
+        "🎉 <b>Profile Submitted!</b>\n\n"
+        "Our moderators are verifying your gesture selfie. You'll receive a notification here once approved!",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard()
     )
 
-    user = await db_fetchrow("SELECT * FROM users WHERE telegram_id = ?", user_id)
-    if user and ADMIN_ID:
-        admin_card = (
-            f"🔄 <b>RESUBMITTED VERIFICATION REVIEW</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Name:</b> {user['name']}, {user['age']} ({user['gender']})\n"
-            f"🆔 <b>Telegram ID:</b> <code>{user_id}</code>\n"
-            f"📍 <b>Location:</b> {user['city']}, {user['state']}\n"
-            f"👉 <b>Assigned Pose:</b> <b>{gesture}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━"
-        )
-        admin_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Approve & Verify Badge", callback_data=f"adm_approve_{user_id}"),
-                    InlineKeyboardButton(text="⚠️ Reject Again", callback_data=f"adm_reject_{user_id}")
-                ],
-                [
-                    InlineKeyboardButton(text="🚫 Permanent Ban", callback_data=f"adm_ban_{user_id}")
-                ]
-            ]
-        )
-        try:
-            await bot.send_photo(
-                chat_id=ADMIN_ID,
-                photo=selfie_id,
-                caption=f"🤳 <b>[RESUBMITTED GESTURE SELFIE]</b>\n{admin_card}",
-                reply_markup=admin_kb,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logging.warning(f"Failed to alert admin on resubmission: {e}")
-
-# --- 1-HOUR ON-DEMAND BOOST ACTIVATION ---
-@dp.callback_query(F.data == "activate_boost_now")
-async def activate_boost_handler(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    now = datetime.now()
-    now_iso = now.isoformat()
-
-    user = await db_fetchrow("SELECT boosts_balance, boost_expires_at FROM users WHERE telegram_id = ?", user_id)
-
-    if not user:
-        try:
-            await callback.answer("Profile not found.")
-        except Exception:
-            pass
-        return
-
-    boost_exp = user.get("boost_expires_at") or ""
-    if boost_exp and boost_exp > now_iso:
-        try:
-            exp = datetime.fromisoformat(boost_exp)
-            remaining_mins = max(1, int((exp - now).total_seconds() / 60))
-            await callback.answer(f"🚀 Your Boost is already active! {remaining_mins} mins remaining.", show_alert=True)
-        except Exception:
-            await callback.answer("🚀 Your Boost is currently active!", show_alert=True)
-        return
-
-    raw_bal = user.get("boosts_balance")
-    user_boosts = int(raw_bal) if raw_bal is not None else 0
-
-    if user_boosts <= 0 and user_id != ADMIN_ID:
-        try:
-            await callback.answer("🚀 You have 0 Boosts in inventory! Tap '🎁 Invite & Boost' to earn more.", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    boost_until = (now + timedelta(hours=1)).isoformat()
-    await db_execute("""
-        UPDATE users 
-        SET boosts_balance = (CASE WHEN COALESCE(boosts_balance, 0) > 0 THEN COALESCE(boosts_balance, 0) - 1 ELSE 0 END),
-            boost_expires_at = ?
-        WHERE telegram_id = ?
-    """, boost_until, user_id)
+    # Dispatch to Admin
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Approve", callback_data=f"verify_ok_{user_id}"),
+            InlineKeyboardButton(text="⚠️ Retake Selfie", callback_data=f"verify_retry_{user_id}")
+        ],
+        [InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{user_id}")]
+    ])
+    user_link = safe_user_mention(user_id, data['full_name'], username)
+    caption = (
+        f"🚨 <b>New Verification Request</b>\n\n"
+        f"👤 <b>User:</b> {user_link} (<code>{user_id}</code>)\n"
+        f"🎂 <b>Age/Gender:</b> {data['age']} | {data['gender']}\n"
+        f"📍 <b>City:</b> {data['city']}\n"
+        f"📝 <b>Bio:</b> {data['bio']}"
+    )
 
     try:
-        await callback.answer("🚀 1-Hour Spotlight Boost Activated! You are now #1 in your city stack.", show_alert=True)
+        await bot.send_photo(ADMIN_ID, data['photo_id'], caption=caption, parse_mode="HTML")
+        await bot.send_photo(
+            ADMIN_ID, gesture_photo_id,
+            caption=f"✌️ <b>Verification Gesture Selfie</b> for <code>{user_id}</code>",
+            parse_mode="HTML",
+            reply_markup=admin_kb
+        )
+    except Exception as e:
+        logger.error(f"Failed to deliver verification alert to admin: {e}")
+
+# ---------------------------------------------------------
+# Verification Callbacks & Selfie Retake Flow
+# ---------------------------------------------------------
+@dp.callback_query(F.data.startswith("verify_ok_"))
+async def callback_verify_ok(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    user_id = int(callback.data.split("_")[2])
+    await db_execute("UPDATE users SET is_verified = 1, is_approved = 1 WHERE telegram_id = ?", user_id)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply(f"✅ Approved & Verified user <code>{user_id}</code>", parse_mode="HTML")
+    try:
+        await bot.send_message(
+            user_id,
+            "🎉 <b>Congratulations! Your profile is verified!</b>\n\n"
+            "You've been granted the Blue Verified Badge 🛡️. Tap <b>🔍 Discover Matches</b> to begin!",
+            parse_mode="HTML"
+        )
     except Exception:
         pass
+    await callback.answer()
 
-    await callback.message.answer(
-        "🚀 <b>BOOST ACTIVATED FOR 1 HOUR!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Your profile has been pushed to the top of the discovery deck for active members nearby. Good luck!",
-        parse_mode="HTML"
-    )
+@dp.callback_query(F.data.startswith("verify_retry_"))
+async def callback_verify_retry(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Admin only.", show_alert=True)
+        return
+    user_id = int(callback.data.split("_")[2])
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply(f"⚠️ Requested selfie retake for <code>{user_id}</code>", parse_mode="HTML")
+    
+    retry_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📸 Retake Verification Selfie", callback_data="start_retake_selfie")]
+    ])
+    try:
+        await bot.send_message(
+            user_id,
+            "⚠️ <b>Verification Gesture Incomplete</b>\n\n"
+            "Our moderators were unable to verify your selfie gesture. "
+            "Please upload a clear, front-facing photo showing the <b>Peace Sign (✌️)</b>.",
+            parse_mode="HTML",
+            reply_markup=retry_kb
+        )
+    except Exception:
+        pass
+    await callback.answer()
 
-# --- VIRAL INVITE & REFERRALS ---
-@dp.message(F.text == "🎁 Invite & Boost")
-@dp.message(Command("invite"))
-async def show_invite_menu(message: types.Message):
-    uid = message.from_user.id
-    bot_info = await bot.get_me()
-    referral_link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
+@dp.callback_query(F.data == "start_retake_selfie")
+async def callback_start_retake(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(RetakeSelfie.waiting_for_photo)
+    await callback.message.answer("📸 Upload your new verification selfie holding up a <b>Peace Sign (✌️)</b>:", parse_mode="HTML")
+    await callback.answer()
 
-    ref_count = await db_fetchval("SELECT COUNT(*) FROM users WHERE referred_by = ?", uid)
-    u = await db_fetchrow("SELECT superlikes_balance, boosts_balance, boost_expires_at FROM users WHERE telegram_id = ?", uid)
+@dp.message(RetakeSelfie.waiting_for_photo, F.photo)
+async def process_retake_photo(message: types.Message, state: FSMContext):
+    gesture_photo_id = message.photo[-1].file_id
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
 
-    sl_bal = u.get("superlikes_balance") if (u and u.get("superlikes_balance") is not None) else 1
-    boost_bal = u.get("boosts_balance") if (u and u.get("boosts_balance") is not None) else 1
-    now_iso = datetime.now().isoformat()
-    boost_exp = u.get("boost_expires_at", "") if u else ""
-    boost_active = "Active 🚀" if boost_exp and boost_exp > now_iso else "Inactive"
+    await db_execute("UPDATE users SET gesture_photo_id = ? WHERE telegram_id = ?", gesture_photo_id, user_id)
+    await state.clear()
+    await message.answer("✅ Your updated verification selfie has been submitted for review.")
 
-    invite_msg = (
-        f"🎁 <b>INVITE FRIENDS & GET REWARDED!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Share your referral link with friends on WhatsApp, Instagram, or Telegram.\n\n"
-        f"<b>YOUR REWARDS PER FRIEND INVITED:</b>\n"
-        f"• ⭐ <b>+3 Free Super Likes</b>\n"
-        f"• 🚀 <b>+1 Spotlight Boost (1-Hour Duration)</b>\n\n"
-        f"📊 <b>Your Inventory & Stats:</b>\n"
-        f"• 👥 Friends Invited: <b>{ref_count}</b>\n"
-        f"• ⭐ Super Likes Balance: <b>{sl_bal}</b>\n"
-        f"• 🚀 Available 1-Hour Boosts: <b>{boost_bal}</b>\n"
-        f"• ⚡ Current Boost Status: <b>{boost_active}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 <b>Your Personal Invite Link:</b>\n"
-        f"<code>{referral_link}</code>"
-    )
-
-    share_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🚀 Activate 1-Hour Boost Now", callback_data="activate_boost_now")
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📲 Share Link on Telegram",
-                    url=f"https://t.me/share/url?url={referral_link}&text=Join%20Soulmate%20India%20to%20find%20authentic%20matches!"
-                )
-            ]
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Approve", callback_data=f"verify_ok_{user_id}"),
+            InlineKeyboardButton(text="⚠️ Reject Again", callback_data=f"verify_retry_{user_id}")
         ]
+    ])
+    user_link = safe_user_mention(user_id, message.from_user.full_name, username)
+    await bot.send_photo(
+        ADMIN_ID,
+        gesture_photo_id,
+        caption=f"🔄 <b>Resubmitted Gesture Selfie</b> from {user_link} (<code>{user_id}</code>)",
+        parse_mode="HTML",
+        reply_markup=admin_kb
     )
 
-    await message.answer(invite_msg, reply_markup=share_kb, parse_mode="HTML")
-
-# --- VIEW & MANAGE PROFILE ---
+# ---------------------------------------------------------
+# User Profile & Soft Account Deactivation
+# ---------------------------------------------------------
 @dp.message(F.text == "👤 My Profile")
-@dp.message(Command("profile"))
-async def show_profile(message: types.Message, state: FSMContext):
-    await state.clear()
+async def cmd_my_profile(message: types.Message):
     user_id = message.from_user.id
-    now = datetime.now()
-    now_iso = now.isoformat()
-
-    user = await db_fetchrow("SELECT * FROM users WHERE telegram_id = ?", user_id)
-
-    if not user:
-        await message.answer("You haven't set up a profile yet. Send /start to begin.")
+    rows = await db_query("SELECT * FROM users WHERE telegram_id = ?", user_id)
+    if not rows:
+        await message.answer("Profile not found. Send /start to register!")
         return
-
-    state_val = user.get("state", "India") or "India"
-    city_val = user.get("city", "Other") or "Other"
-    my_goal_label = GOAL_LABELS.get(user.get("dating_goal", "Long-Term"), "💍 Long-Term / True Love")
-
-    total_likes = await db_fetchval("SELECT COUNT(*) FROM swipes WHERE target_id = ? AND action = 'like'", user_id)
-    total_matches = await db_fetchval("SELECT COUNT(*) FROM matches WHERE user1_id = ? OR user2_id = ?", user_id, user_id)
-    total_swiped = await db_fetchval("SELECT COUNT(*) FROM swipes WHERE swiper_id = ?", user_id)
-    city_user_count = await db_fetchval("SELECT COUNT(*) FROM users WHERE city = ? AND is_approved = 1", city_val)
-    total_user_count = await db_fetchval("SELECT COUNT(*) FROM users WHERE is_approved = 1")
-
-    status_tag = "✅ Approved & Verified" if user.get("is_verified", 0) == 1 else ("⏳ Under Review" if user.get("is_approved", 0) == 0 else "✓ Active")
-    v_badge = " ✅ [Verified]" if user.get("is_verified", 0) == 1 else ""
-
-    boost_exp = user.get("boost_expires_at") or ""
-    raw_bal = user.get("boosts_balance")
-    boost_stock = int(raw_bal) if raw_bal is not None else 0
-
-    if boost_exp and boost_exp > now_iso:
-        try:
-            exp = datetime.fromisoformat(boost_exp)
-            remaining_mins = max(1, int((exp - now).total_seconds() / 60))
-            boost_status = f"🚀 ACTIVE ({remaining_mins}m left)"
-        except Exception:
-            boost_status = "🚀 ACTIVE"
-    else:
-        boost_status = f"Inactive ({boost_stock} in stock)"
-
-    scope_display = "📍 Same City Only" if user.get("search_scope", "same_city") == "same_city" else "🇮🇳 All India (Nationwide)"
-    sl_stock = int(user.get("superlikes_balance")) if user.get("superlikes_balance") is not None else 0
-
-    icebreaker_text = ""
-    if user.get("icebreaker_question") and user.get("icebreaker_answer"):
-        icebreaker_text = f"\n💡 <i>{user['icebreaker_question']}</i>\n👉 <b>{user['icebreaker_answer']}</b>\n━━━━━━━━━━━━━━━━━━━━━━"
-
-    profile_card = (
-        f"👤 <b>{user['name'].upper()}</b>{v_badge}, {user['age']}\n"
-        f"📍 <i>{city_val}, {state_val}</i>\n"
-        f"🎯 <b>My Goal:</b> {my_goal_label}\n"
-        f"🛡️ <b>Status:</b> {status_tag}\n"
-        f"🚀 <b>Spotlight Boost:</b> {boost_status}\n"
-        f"⭐ <b>Super Likes:</b> {sl_stock}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"❝ {user['bio']} ❞\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
-        f"{icebreaker_text}\n"
-        f"📊 <b>YOUR STATS:</b>\n"
-        f"• 💌 <b>Likes Received:</b> {total_likes}\n"
-        f"• 👥 <b>Total Matches:</b> {total_matches}\n"
-        f"• 🔥 <b>Profiles Explored:</b> {total_swiped}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🌐 <b>COMMUNITY:</b>\n"
-        f"• 🏙️ <b>Verified in {city_val}:</b> {city_user_count}\n"
-        f"• 🇮🇳 <b>Verified in India:</b> {total_user_count}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔍 <b>Location Scope:</b> {scope_display}"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🚀 Activate 1-Hour Boost", callback_data="activate_boost_now"),
-                InlineKeyboardButton(text="🎁 Get More Boosts", callback_data="open_invite_btn")
-            ],
-            [
-                InlineKeyboardButton(text="✍️ Edit Bio", callback_data="edit_bio_btn"),
-                InlineKeyboardButton(text="📸 Change Photo", callback_data="edit_photo_btn")
-            ],
-            [
-                InlineKeyboardButton(text="📍 Update City", callback_data="edit_city_btn"),
-                InlineKeyboardButton(text="🎯 Change Goal", callback_data="edit_goal_btn")
-            ],
-            [
-                InlineKeyboardButton(text="🗑️ Delete Account", callback_data="confirm_delete_btn")
-            ]
-        ]
-    )
-
-    await message.answer_photo(
-        photo=user["photo_file_id"],
-        caption=profile_card,
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-
-# --- EDIT PROFILE & PREFERENCES ---
-@dp.callback_query(F.data == "open_invite_btn")
-async def open_invite_callback(callback: types.CallbackQuery):
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-    await show_invite_menu(callback.message)
-
-@dp.callback_query(F.data == "edit_bio_btn")
-async def edit_bio_start(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-    await callback.message.answer("✍️ <b>Enter your new bio:</b>", parse_mode="HTML")
-    await state.set_state(EditProfile.edit_bio)
-
-@dp.message(EditProfile.edit_bio)
-async def edit_bio_save(message: types.Message, state: FSMContext):
-    await db_execute("UPDATE users SET bio = ? WHERE telegram_id = ?", message.text.strip(), message.from_user.id)
-    await state.clear()
-    menu = await get_main_menu(message.from_user.id)
-    await message.answer("✅ <b>Bio updated successfully.</b>", reply_markup=menu, parse_mode="HTML")
-
-@dp.callback_query(F.data == "edit_photo_btn")
-async def edit_photo_start(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-    await callback.message.answer("📸 <b>Send your new portrait photo:</b>", parse_mode="HTML")
-    await state.set_state(EditProfile.edit_photo)
-
-@dp.message(EditProfile.edit_photo, F.photo)
-async def edit_photo_save(message: types.Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
-    await db_execute("UPDATE users SET photo_file_id = ? WHERE telegram_id = ?", photo_id, message.from_user.id)
-    await state.clear()
-    menu = await get_main_menu(message.from_user.id)
-    await message.answer("✅ <b>Photo updated successfully.</b>", reply_markup=menu, parse_mode="HTML")
-
-@dp.callback_query(F.data == "edit_goal_btn")
-async def edit_goal_menu(callback: types.CallbackQuery):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💍 Long-Term / True Love", callback_data="setgoal_Long-Term")],
-            [InlineKeyboardButton(text="🥂 Casual Dating / Hookups", callback_data="setgoal_Casual")],
-            [InlineKeyboardButton(text="☕ Dates & Explore", callback_data="setgoal_Open")],
-            [InlineKeyboardButton(text="🤝 New Friends", callback_data="setgoal_Friends")]
-        ]
-    )
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-    await callback.message.answer("🎯 <b>Select your new dating intent / goal:</b>", reply_markup=keyboard, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("setgoal_"))
-async def save_goal_preference(callback: types.CallbackQuery):
-    goal = callback.data.replace("setgoal_", "")
-    await db_execute("UPDATE users SET dating_goal = ? WHERE telegram_id = ?", goal, callback.from_user.id)
-    try:
-        await callback.answer("Goal updated!")
-    except Exception:
-        pass
-    await callback.message.edit_text(f"✅ <b>Your dating goal is now:</b> {GOAL_LABELS.get(goal, goal)}\nSend /profile to view.", parse_mode="HTML")
-
-@dp.message(F.text == "⚙️ Preferences")
-async def show_preferences_menu(message: types.Message):
-    user_id = message.from_user.id
-
-    user = await db_fetchrow("SELECT target_gender, search_scope, intent_filter, dating_goal FROM users WHERE telegram_id = ?", user_id)
-
-    current_scope = "📍 Same City Only" if user and user.get("search_scope", "same_city") == "same_city" else "🇮🇳 All India (Nationwide)"
-    current_tgt = user.get("target_gender", "Everyone") if user else "Everyone"
-    current_filter = "🎯 Compatible Goals Only" if user and user.get("intent_filter", "flexible") == "strict" else "🌐 Show All Goals"
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📍 My City Only", callback_data="scope_same_city"),
-                InlineKeyboardButton(text="🇮🇳 Nationwide", callback_data="scope_all_india")
-            ],
-            [
-                InlineKeyboardButton(text="🎯 Match Same Intent", callback_data="intent_strict"),
-                InlineKeyboardButton(text="🌐 Show All Intents", callback_data="intent_flexible")
-            ],
-            [
-                InlineKeyboardButton(text="Men", callback_data="settgt_Male"),
-                InlineKeyboardButton(text="Women", callback_data="settgt_Female"),
-                InlineKeyboardButton(text="Everyone", callback_data="settgt_Everyone")
-            ]
-        ]
-    )
-
-    text = (
-        f"⚙️ <b>DISCOVERY PREFERENCES:</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>Location Scope:</b> {current_scope}\n"
-        f"• <b>Intent Filter:</b> {current_filter}\n"
-        f"• <b>Interested In:</b> {current_tgt}\n\n"
-        f"Tap an option below to update:"
-    )
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("intent_"))
-async def save_intent_filter(callback: types.CallbackQuery):
-    filt = callback.data.replace("intent_", "")
-    await db_execute("UPDATE users SET intent_filter = ? WHERE telegram_id = ?", filt, callback.from_user.id)
+    u = rows[0]
+    badge = "🛡️ Verified" if u["is_verified"] else "⏳ Under Verification"
+    status = "Active" if u["is_approved"] else "Paused / Inactive"
     
-    label = "🎯 Compatible Goals Only (Strict)" if filt == "strict" else "🌐 Show All Goals (Flexible)"
-    try:
-        await callback.answer("Intent filter updated!")
-    except Exception:
-        pass
-    await callback.message.edit_text(f"✅ <b>Intent filter set to:</b> {label}\nExplore matches in <b>🔍 Discover</b>.", parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("scope_"))
-async def save_scope_preference(callback: types.CallbackQuery):
-    scope = callback.data.replace("scope_", "")
-    await db_execute("UPDATE users SET search_scope = ? WHERE telegram_id = ?", scope, callback.from_user.id)
-    
-    label = "📍 Same City Only" if scope == "same_city" else "🇮🇳 All India (Nationwide)"
-    try:
-        await callback.answer(f"Scope: {label}")
-    except Exception:
-        pass
-    await callback.message.edit_text(f"✅ <b>Location filter updated to:</b> {label}\nTap <b>🔍 Discover</b> to browse.", parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("settgt_"))
-async def edit_target_save(callback: types.CallbackQuery):
-    tgt = callback.data.replace("settgt_", "")
-    await db_execute("UPDATE users SET target_gender = ? WHERE telegram_id = ?", tgt, callback.from_user.id)
-    try:
-        await callback.answer("Saved!")
-    except Exception:
-        pass
-    await callback.message.edit_text(f"✅ <b>Matching preference set to:</b> {tgt}", parse_mode="HTML")
-
-@dp.callback_query(F.data == "edit_city_btn")
-async def edit_city_start(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-    await callback.message.answer("📍 <b>Select your new State / Region:</b>", reply_markup=get_states_keyboard("editstate_"), parse_mode="HTML")
-    await state.set_state(EditProfile.edit_state)
-
-@dp.callback_query(EditProfile.edit_state, F.data.startswith("editstate_"))
-async def edit_state_step(callback: types.CallbackQuery, state: FSMContext):
-    st_name = callback.data.replace("editstate_", "")
-    await state.update_data(state=st_name)
-    await callback.message.edit_text(
-        f"📍 Region: <b>{st_name}</b>\n\n<b>Select your new City:</b>",
-        reply_markup=get_cities_keyboard(st_name, "editcity_"),
-        parse_mode="HTML"
+    caption = (
+        f"👤 <b>{u['full_name']}</b>, {u['age']}\n"
+        f"📍 {u['city']}\n"
+        f"Badge: {badge}\n"
+        f"Visibility: {status}\n\n"
+        f"📝 <i>{u['bio']}</i>"
     )
-    await state.set_state(EditProfile.edit_city)
-    try:
-        await callback.answer()
-    except Exception:
-        pass
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑️ Deactivate Profile", callback_data="confirm_soft_delete")]
+    ])
+    await message.answer_photo(u["photo_id"], caption=caption, parse_mode="HTML", reply_markup=kb)
 
-@dp.callback_query(EditProfile.edit_city, F.data.startswith("editcity_"))
-async def edit_city_save(callback: types.CallbackQuery, state: FSMContext):
-    city_name = callback.data.replace("editcity_", "")
-    data = await state.get_data()
-    await db_execute(
-        "UPDATE users SET state = ?, city = ? WHERE telegram_id = ?",
-        data.get("state", "India"), city_name, callback.from_user.id
-    )
-    await state.clear()
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-    await callback.message.edit_text(f"✅ <b>Location updated to:</b> {city_name}, {data.get('state', 'India')}", parse_mode="HTML")
-
-# --- DELETE ACCOUNT ---
-@dp.callback_query(F.data == "confirm_delete_btn")
-async def ask_delete_confirmation(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🗑️ Permanently Delete", callback_data="do_delete_account"),
-                InlineKeyboardButton(text="Cancel", callback_data="cancel_delete")
-            ]
+@dp.callback_query(F.data == "confirm_soft_delete")
+async def cb_confirm_soft_delete(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Yes, Deactivate", callback_data="do_soft_delete"),
+            InlineKeyboardButton(text="Cancel", callback_data="cancel_delete")
         ]
-    )
-    await callback.message.answer(
-        "⚠️ <b>Delete Account Confirmation</b>\n\nThis will permanently remove your profile, swipes, and matches.",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+    ])
+    await callback.message.reply("Are you sure you want to pause your profile? It will no longer be visible to others in discovery.", reply_markup=kb)
+    await callback.answer()
 
 @dp.callback_query(F.data == "cancel_delete")
-async def cancel_delete_handler(callback: types.CallbackQuery):
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-    await callback.message.edit_text("<b>Action cancelled.</b> Your profile remains active.", parse_mode="HTML")
+async def cb_cancel_delete(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.answer("Cancelled.")
 
-@dp.callback_query(F.data == "do_delete_account")
-async def perform_delete_account(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "do_soft_delete")
+async def cb_do_soft_delete(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    await state.clear()
-    await db_execute("DELETE FROM users WHERE telegram_id = ?", user_id)
-    await db_execute("DELETE FROM swipes WHERE swiper_id = ? OR target_id = ?", user_id, user_id)
-    await db_execute("DELETE FROM matches WHERE user1_id = ? OR user2_id = ?", user_id, user_id)
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-    await callback.message.edit_text("🗑️ <b>Your account has been deleted.</b> Send /start anytime to return.", parse_mode="HTML")
-
-# --- DISCOVER & SWIPING ---
-@dp.message(F.text == "🔍 Discover")
-@dp.message(Command("find"))
-async def start_discovery(message: types.Message, state: FSMContext):
-    await state.clear()
-    await show_next_candidate(chat_id=message.chat.id, user_id=message.from_user.id)
-
-@dp.callback_query(F.data.startswith("swipe_"))
-async def handle_swipe(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    _, action, target_id_str = callback.data.split("_")
-    target_id = int(target_id_str)
-    swiper_id = callback.from_user.id
-    chat_id = callback.message.chat.id
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    swiper_info = await db_fetchrow("SELECT name, city, superlikes_balance, daily_swipes_count, last_swipe_date FROM users WHERE telegram_id = ?", swiper_id)
-
-    swiper_name = swiper_info.get("name", "Someone") if swiper_info else "Someone"
-    swiper_city = swiper_info.get("city", "nearby") if swiper_info else "nearby"
-    current_swipes = swiper_info.get("daily_swipes_count", 0) if swiper_info and swiper_info.get("last_swipe_date") == today else 0
-
-    await db_execute(
-        "UPDATE users SET daily_swipes_count = ?, last_swipe_date = ? WHERE telegram_id = ?",
-        current_swipes + 1, today, swiper_id
-    )
-
-    if action == "super":
-        sl_bal = swiper_info.get("superlikes_balance", 0) if swiper_info else 0
-        if sl_bal <= 0 and swiper_id != ADMIN_ID:
-            try:
-                await callback.answer("⭐ You have 0 Super Likes remaining! Invite friends in '🎁 Invite & Boost' to get more.", show_alert=True)
-            except Exception:
-                pass
-            return
-        
-        await db_execute("""
-            UPDATE users 
-            SET superlikes_balance = (CASE WHEN COALESCE(superlikes_balance, 0) > 0 THEN COALESCE(superlikes_balance, 0) - 1 ELSE 0 END) 
-            WHERE telegram_id = ?
-        """, swiper_id)
-        action = "like"
-
-        try:
-            target_menu = await get_main_menu(target_id)
-            await bot.send_message(
-                target_id,
-                f"⭐ <b>You received a Super Like!</b>\n"
-                f"<b>{swiper_name}</b> from {swiper_city} Super Liked your profile.\n\n"
-                f"Tap <b>💌 Likes Received</b> to view their card and match back!",
-                reply_markup=target_menu,
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-    await db_execute(
-        "INSERT INTO swipes (swiper_id, target_id, action) VALUES (?, ?, ?) ON CONFLICT (swiper_id, target_id) DO UPDATE SET action = EXCLUDED.action",
-        swiper_id, target_id, action
-    )
-
-    if action == "like":
-        mutual = await db_fetchrow("SELECT * FROM swipes WHERE swiper_id = ? AND target_id = ? AND action = 'like'", target_id, swiper_id)
-
-        if mutual:
-            u1 = min(swiper_id, target_id)
-            u2 = max(swiper_id, target_id)
-            await db_execute(
-                "INSERT INTO matches (user1_id, user2_id, user1_shared, user2_shared, created_at) VALUES (?, ?, 0, 0, ?) ON CONFLICT DO NOTHING",
-                u1, u2, today
-            )
-
-            user_obj = await db_fetchrow("SELECT name FROM users WHERE telegram_id = ?", swiper_id)
-            target_obj = await db_fetchrow("SELECT name FROM users WHERE telegram_id = ?", target_id)
-
-            kb_to_target = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🤝 Share My Handle", callback_data=f"sharehandle_{swiper_id}")]]
-            )
-            kb_to_swiper = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🤝 Share My Handle", callback_data=f"sharehandle_{target_id}")]]
-            )
-
-            match_text_target = (
-                f"🎉 <b>IT'S A MUTUAL MATCH!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"You and <b>{user_obj['name']}</b> liked each other!\n\n"
-                f"<i>Handles are kept private until both members tap Share below.</i>"
-            )
-            match_text_swiper = (
-                f"🎉 <b>IT'S A MUTUAL MATCH!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"You and <b>{target_obj['name']}</b> liked each other!\n\n"
-                f"<i>Handles are kept private until both members tap Share below.</i>"
-            )
-
-            try:
-                await bot.send_message(target_id, match_text_target, reply_markup=kb_to_target, parse_mode="HTML")
-            except Exception:
-                pass
-
-            await bot.send_message(chat_id, match_text_swiper, reply_markup=kb_to_swiper, parse_mode="HTML")
-
-        else:
-            try:
-                target_menu = await get_main_menu(target_id)
-                await bot.send_message(
-                    target_id,
-                    f"💌 <b>Someone liked your profile!</b>\n"
-                    f"A member from <b>{swiper_city}</b> just liked your card.\n\n"
-                    f"Tap <b>💌 Likes Received</b> below to review and match back!",
-                    reply_markup=target_menu,
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logging.warning(f"Could not send like notification: {e}")
-
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-
-    await show_next_candidate(chat_id=chat_id, user_id=swiper_id)
-
-# --- LIKES RECEIVED FEED ---
-@dp.message(F.text.startswith("💌 Likes Received"))
-async def show_likes_received(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-
-    query = """
-        SELECT u.* FROM users u
-        JOIN swipes s ON u.telegram_id = s.swiper_id
-        WHERE s.target_id = ? AND s.action = 'like'
-          AND u.is_approved = 1 AND u.is_banned = 0
-          AND u.telegram_id NOT IN (SELECT target_id FROM swipes WHERE swiper_id = ?)
-        LIMIT 1
-    """
-    admirer = await db_fetchrow(query, user_id, user_id)
-
-    if not admirer:
-        menu = await get_main_menu(user_id)
-        await message.answer(
-            "💌 <b>No pending likes right now.</b>\nKeep discovering in <b>🔍 Discover</b> to be seen by more members!",
-            reply_markup=menu,
-            parse_mode="HTML"
-        )
-        return
-
-    admirer_goal_label = GOAL_LABELS.get(admirer.get("dating_goal", "Open"), "☕ Dates & Explore")
-    v_badge = " ✅ [Verified]" if admirer.get("is_verified", 0) == 1 else ""
-
-    icebreaker_section = ""
-    if admirer.get("icebreaker_question") and admirer.get("icebreaker_answer"):
-        icebreaker_section = f"\n💡 <i>{admirer['icebreaker_question']}</i>\n👉 <b>{admirer['icebreaker_answer']}</b>\n━━━━━━━━━━━━━━━━━━━━━━"
-
-    card_text = (
-        f"💌 <b>SOMEONE LIKED YOUR PROFILE!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 <b>{admirer['name'].upper()}</b>{v_badge}, {admirer['age']}\n"
-        f"📍 <i>{admirer['city']}, {admirer['state']}</i>\n"
-        f"🎯 <b>Goal:</b> {admirer_goal_label}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"❝ {admirer['bio']} ❞\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
-        f"{icebreaker_section}\n"
-        f"<i>Tap ❤️ Like Back to instantly match!</i>"
-    )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="✕ Pass", callback_data=f"likefeed_pass_{admirer['telegram_id']}"),
-            InlineKeyboardButton(text="❤️ Like Back", callback_data=f"likefeed_like_{admirer['telegram_id']}")
-        ]]
-    )
-
-    await message.answer_photo(
-        photo=admirer["photo_file_id"],
-        caption=card_text,
-        reply_markup=keyboard,
+    await db_execute("UPDATE users SET is_approved = 0, is_verified = 0 WHERE telegram_id = ?", user_id)
+    await callback.message.edit_text(
+        "🗑️ <b>Your profile has been deactivated.</b>\n\n"
+        "Your card is hidden from discovery. You can return anytime by sending /start.",
         parse_mode="HTML"
     )
+    await callback.answer()
 
-@dp.callback_query(F.data.startswith("likefeed_"))
-async def handle_likefeed_action(callback: types.CallbackQuery, state: FSMContext):
+# ---------------------------------------------------------
+# User Feedback Engine + Direct Admin Response
+# ---------------------------------------------------------
+@dp.message(F.text.in_(["/feedback", "💬 Feedback"]))
+async def cmd_feedback(message: types.Message, state: FSMContext):
+    await state.set_state(FeedbackStates.waiting_for_feedback)
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_feedback")]
+    ])
+    await message.answer(
+        "📝 <b>We value your thoughts!</b>\n\n"
+        "Share feedback, suggest a feature, or report an issue below:",
+        parse_mode="HTML",
+        reply_markup=cancel_kb
+    )
+
+@dp.callback_query(F.data == "cancel_feedback")
+async def cb_cancel_feedback(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    _, action, target_id_str = callback.data.split("_")
-    target_id = int(target_id_str)
+    await callback.message.edit_text("Feedback cancelled.")
+    await callback.answer()
+
+@dp.message(FeedbackStates.waiting_for_feedback)
+async def process_feedback(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    feedback_text = message.text or message.caption or "[Media / Attachment]"
+    full_name = message.from_user.full_name
+    username = message.from_user.username
+
+    await db_execute("INSERT INTO feedback (user_id, feedback_text) VALUES (?, ?)", user_id, feedback_text)
+    await state.clear()
+    await message.answer("💌 <b>Thank you!</b> Your feedback has been sent directly to our moderators.", parse_mode="HTML")
+
+    user_link = safe_user_mention(user_id, full_name, username)
+    admin_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Reply to User", callback_data=f"admin_prep_reply_{user_id}")],
+        [InlineKeyboardButton(text="🚫 Ban User", callback_data=f"admin_ban_{user_id}")]
+    ])
+    admin_alert = (
+        f"📬 <b>New Feedback Received!</b>\n\n"
+        f"👤 <b>From:</b> {user_link} (<code>{user_id}</code>)\n\n"
+        f"💬 <b>Feedback:</b>\n{feedback_text}"
+    )
+    try:
+        await bot.send_message(ADMIN_ID, admin_alert, parse_mode="HTML", reply_markup=admin_markup)
+    except Exception as e:
+        logger.error(f"Failed to alert admin of feedback: {e}")
+
+# ---------------------------------------------------------
+# User Reporting System
+# ---------------------------------------------------------
+@dp.callback_query(F.data.startswith("report_card_"))
+async def cb_report_card(callback: types.CallbackQuery):
+    reported_id = int(callback.data.split("_")[2])
+    reasons_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 Fake Profile / Bot", callback_data=f"do_report_{reported_id}_Fake")],
+        [InlineKeyboardButton(text="🔞 Inappropriate Bio/Photo", callback_data=f"do_report_{reported_id}_Inappropriate")],
+        [InlineKeyboardButton(text="😡 Harassment / Abuse", callback_data=f"do_report_{reported_id}_Harassment")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="cancel_report")]
+    ])
+    await callback.message.reply("🚨 <b>Select a reason for reporting this profile:</b>", parse_mode="HTML", reply_markup=reasons_kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel_report")
+async def cb_cancel_report(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.answer("Report cancelled.")
+
+@dp.callback_query(F.data.startswith("do_report_"))
+async def cb_do_report(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    reported_id = int(parts[2])
+    reason = parts[3]
+    reporter_id = callback.from_user.id
+
+    await db_execute("INSERT INTO reports (reporter_id, reported_id, reason) VALUES (?, ?, ?)", reporter_id, reported_id, reason)
+    await callback.message.edit_text("✅ <b>Report submitted.</b> Our moderation team will investigate.", parse_mode="HTML")
+    await callback.answer()
+
+    # Alert Admin
+    rep_user = (await db_query("SELECT * FROM users WHERE telegram_id = ?", reported_id))
+    rep_name = rep_user[0]['full_name'] if rep_user else f"ID: {reported_id}"
+    
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 View Profile", callback_data=f"inspect_user_{reported_id}")],
+        [
+            InlineKeyboardButton(text="🚫 Ban Target", callback_data=f"admin_ban_{reported_id}"),
+            InlineKeyboardButton(text="Dismiss", callback_data="dismiss_report")
+        ]
+    ])
+    alert_text = (
+        f"🚨 <b>Profile Reported!</b>\n\n"
+        f"• <b>Reported:</b> {rep_name} (<code>{reported_id}</code>)\n"
+        f"• <b>Reporter:</b> <code>{reporter_id}</code>\n"
+        f"• <b>Reason:</b> {reason}"
+    )
+    await bot.send_message(ADMIN_ID, alert_text, parse_mode="HTML", reply_markup=admin_kb)
+
+@dp.callback_query(F.data == "dismiss_report")
+async def cb_dismiss_report(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.answer("Report dismissed.")
+
+# ---------------------------------------------------------
+# Discovery & Matching Engine
+# ---------------------------------------------------------
+@dp.message(F.text == "🔍 Discover Matches")
+async def cmd_discover(message: types.Message):
+    user_id = message.from_user.id
+    current_users = await db_query("SELECT * FROM users WHERE telegram_id = ?", user_id)
+    if not current_users or not current_users[0]["is_approved"]:
+        await message.answer("⚠️ You must have an approved profile to discover matches.")
+        return
+    
+    deck = await db_query("""
+        SELECT * FROM users 
+        WHERE is_approved = 1 
+          AND is_banned = 0 
+          AND telegram_id != ?
+          AND telegram_id NOT IN (SELECT swiped_id FROM swipes WHERE swiper_id = ?)
+        LIMIT 1
+    """, user_id, user_id)
+
+    if not deck:
+        await message.answer("🎉 You have caught up on all profiles! Check back later for new members.")
+        return
+
+    candidate = deck[0]
+    candidate_id = candidate["telegram_id"]
+    badge = "🛡️" if candidate["is_verified"] else ""
+    caption = (
+        f"✨ <b>{candidate['full_name']}</b>, {candidate['age']} {badge}\n"
+        f"📍 {candidate['city']}\n\n"
+        f"📝 <i>{candidate['bio']}</i>"
+    )
+    swipe_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="❌ Pass", callback_data=f"swipe_pass_{candidate_id}"),
+            InlineKeyboardButton(text="❤️ Like", callback_data=f"swipe_like_{candidate_id}")
+        ],
+        [InlineKeyboardButton(text="🚨 Report", callback_data=f"report_card_{candidate_id}")]
+    ])
+    await message.answer_photo(candidate["photo_id"], caption=caption, parse_mode="HTML", reply_markup=swipe_kb)
+
+@dp.callback_query(F.data.startswith("swipe_"))
+async def handle_swipe(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    action = parts[1]
+    candidate_id = int(parts[2])
     swiper_id = callback.from_user.id
-    chat_id = callback.message.chat.id
-    today = datetime.now().strftime("%Y-%m-%d")
 
     await db_execute(
-        "INSERT INTO swipes (swiper_id, target_id, action) VALUES (?, ?, ?) ON CONFLICT (swiper_id, target_id) DO UPDATE SET action = EXCLUDED.action",
-        swiper_id, target_id, action
+        "INSERT INTO swipes (swiper_id, swiped_id, action) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        swiper_id, candidate_id, action
     )
+    await callback.message.delete()
 
     if action == "like":
-        u1 = min(swiper_id, target_id)
-        u2 = max(swiper_id, target_id)
-        await db_execute(
-            "INSERT INTO matches (user1_id, user2_id, user1_shared, user2_shared, created_at) VALUES (?, ?, 0, 0, ?) ON CONFLICT DO NOTHING",
-            u1, u2, today
+        mutual = await db_query(
+            "SELECT * FROM swipes WHERE swiper_id = ? AND swiped_id = ? AND action = 'like'",
+            candidate_id, swiper_id
         )
+        if mutual:
+            u1, u2 = min(swiper_id, candidate_id), max(swiper_id, candidate_id)
+            await db_execute("INSERT INTO matches (user1_id, user2_id) VALUES (?, ?) ON CONFLICT DO NOTHING", u1, u2)
+            
+            swiper_info = (await db_query("SELECT * FROM users WHERE telegram_id = ?", swiper_id))[0]
+            cand_info = (await db_query("SELECT * FROM users WHERE telegram_id = ?", candidate_id))[0]
 
-        user_obj = await db_fetchrow("SELECT name FROM users WHERE telegram_id = ?", swiper_id)
-        target_obj = await db_fetchrow("SELECT name FROM users WHERE telegram_id = ?", target_id)
+            cand_mention = safe_user_mention(cand_info['telegram_id'], cand_info['full_name'], cand_info['username'])
+            swiper_mention = safe_user_mention(swiper_info['telegram_id'], swiper_info['full_name'], swiper_info['username'])
 
-        kb_to_target = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🤝 Share My Handle", callback_data=f"sharehandle_{swiper_id}")]]
-        )
-        kb_to_swiper = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🤝 Share My Handle", callback_data=f"sharehandle_{target_id}")]]
-        )
+            await callback.message.answer(f"🎉 <b>It's a Match!</b>\nYou and {cand_mention} liked each other! Start chatting!", parse_mode="HTML")
+            try:
+                await bot.send_message(candidate_id, f"🎉 <b>It's a Match!</b>\nYou and {swiper_mention} liked each other! Say hello!", parse_mode="HTML")
+            except TelegramForbiddenError:
+                await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", candidate_id)
+            except Exception:
+                pass
 
-        match_text_target = (
-            f"🎉 <b>IT'S A MUTUAL MATCH!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"You and <b>{user_obj['name']}</b> liked each other!\n\n"
-            f"<i>Handles are kept private until both members tap Share below.</i>"
-        )
-        match_text_swiper = (
-            f"🎉 <b>IT'S A MUTUAL MATCH!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"You and <b>{target_obj['name']}</b> liked each other!\n\n"
-            f"<i>Handles are kept private until both members tap Share below.</i>"
-        )
+    await cmd_discover(callback.message)
+    await callback.answer()
 
-        try:
-            await bot.send_message(target_id, match_text_target, reply_markup=kb_to_target, parse_mode="HTML")
-        except Exception:
-            pass
-
-        await bot.send_message(chat_id, match_text_swiper, reply_markup=kb_to_swiper, parse_mode="HTML")
-
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-
-    await show_likes_received(callback.message, state)
-
-# --- CONTACT SHARING EXCHANGE (NO @NONE, PRIVACY-SAFE) ---
-@dp.callback_query(F.data.startswith("sharehandle_"))
-async def handle_share_contact(callback: types.CallbackQuery):
-    partner_id = int(callback.data.replace("sharehandle_", ""))
-    my_id = callback.from_user.id
-    u1, u2 = min(my_id, partner_id), max(my_id, partner_id)
-
-    if my_id == u1:
-        await db_execute("UPDATE matches SET user1_shared = 1 WHERE user1_id = ? AND user2_id = ?", u1, u2)
-    else:
-        await db_execute("UPDATE matches SET user2_shared = 1 WHERE user1_id = ? AND user2_id = ?", u1, u2)
-
-    match_row = await db_fetchrow("SELECT * FROM matches WHERE user1_id = ? AND user2_id = ?", u1, u2)
-    me = await db_fetchrow("SELECT name, username FROM users WHERE telegram_id = ?", my_id)
-    partner = await db_fetchrow("SELECT name, username FROM users WHERE telegram_id = ?", partner_id)
-
-    try:
-        await callback.answer("Handle shared!", show_alert=False)
-    except Exception:
-        pass
-
-    if match_row and match_row.get("user1_shared", 0) == 1 and match_row.get("user2_shared", 0) == 1:
-        my_contact = f"@{me['username']}" if me.get('username') else f"<a href='tg://user?id={my_id}'>💬 Open Chat with {me['name']}</a>"
-        partner_contact = f"@{partner['username']}" if partner.get('username') else f"<a href='tg://user?id={partner_id}'>💬 Open Chat with {partner['name']}</a>"
-
-        await callback.message.answer(
-            f"🔓 <b>Mutual Contact Unlocked!</b>\n\n"
-            f"<b>{partner['name']}</b> has shared their direct contact:\n"
-            f"👉 {partner_contact}\n\n"
-            f"Tap above to begin chatting directly on Telegram!",
-            parse_mode="HTML"
-        )
-        try:
-            await bot.send_message(
-                partner_id,
-                f"🔓 <b>Mutual Contact Unlocked!</b>\n\n"
-                f"<b>{me['name']}</b> has shared their direct contact with you:\n"
-                f"👉 {my_contact}\n\n"
-                f"Tap above to begin chatting directly on Telegram!",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-    else:
-        await callback.message.answer(
-            f"✓ <b>You shared your contact with {partner['name']}.</b>\n"
-            f"As soon as they tap Share back, their link will unlock here.",
-            parse_mode="HTML"
-        )
-        try:
-            await bot.send_message(
-                partner_id,
-                f"💌 <b>{me['name']}</b> just opted to share their Telegram contact with you!\n"
-                f"Tap <b>👥 My Matches</b> to view their card and share yours back.",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-# --- MY MATCHES LIST ---
-@dp.message(F.text == "👥 My Matches")
-async def list_matches(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-
-    query = """
-        SELECT u.*, m.user1_shared, m.user2_shared, m.user1_id 
-        FROM users u
-        JOIN matches m ON (u.telegram_id = m.user1_id OR u.telegram_id = m.user2_id)
-        WHERE (m.user1_id = ? OR m.user2_id = ?) AND u.telegram_id != ?
-    """
-    matches = await db_fetchall(query, user_id, user_id, user_id)
-
-    if not matches:
-        await message.answer(
-            "👥 <b>You don't have any active matches yet.</b>\nStart swiping in <b>🔍 Discover</b> to match!",
-            parse_mode="HTML"
-        )
+# ---------------------------------------------------------
+# Admin Help Center & Control Panel
+# ---------------------------------------------------------
+@dp.message(Command("admin", "admin_help"))
+async def cmd_admin_help(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
         return
 
-    await message.answer(f"👥 <b>Your Matches ({len(matches)}):</b>", parse_mode="HTML")
+    admin_text = (
+        "🛠️ <b>Soulmate India Admin Control Center</b>\n\n"
+        "Here is the complete reference of all moderation and operational commands:\n\n"
+        "📊 <b>Diagnostics & Monitoring:</b>\n"
+        "• <code>/admin_stats</code> — Live DB engine, active users, matches, swipes, reports, drop-offs.\n"
+        "• <code>/user &lt;id&gt;</code> — Detailed dossier (photos, swipe counts, matches, ban toggles).\n\n"
+        "📢 <b>Targeted & Global Broadcasts:</b>\n"
+        "• <code>/broadcast &lt;message&gt;</code> — Global announcement to all active users.\n"
+        "• <code>/broadcast_city &lt;City&gt; &lt;msg&gt;</code> — Send notice strictly to users in that city.\n"
+        "• <code>/broadcast_gender &lt;Male|Female&gt; &lt;msg&gt;</code> — Send targeted update by gender.\n\n"
+        "💬 <b>Direct User Messaging:</b>\n"
+        "• <code>/notice &lt;id&gt; &lt;message&gt;</code> — Send an official admin notice banner to one user.\n"
+        "• <code>/reply &lt;id&gt; &lt;message&gt;</code> — Send an official support reply through the bot.\n\n"
+        "🛡️ <b>Moderation & Access:</b>\n"
+        "• <code>/ban &lt;id&gt;</code> — Soft-hide and suspend a user from discovery.\n"
+        "• <code>/unban &lt;id&gt;</code> — Restore an account to active discovery.\n\n"
+        "⏰ <b>Retention & Re-engagement Nudges:</b>\n"
+        "• <code>/remind_unverified</code> — Ping users awaiting selfie verification.\n"
+        "• <code>/remind_incomplete</code> — Ping dropped-off registrations to finish signup."
+    )
 
-    for m in matches:
-        is_u1 = (user_id == m["user1_id"])
-        my_shared = m.get("user1_shared", 0) if is_u1 else m.get("user2_shared", 0)
-        partner_shared = m.get("user2_shared", 0) if is_u1 else m.get("user1_shared", 0)
-        m_goal_label = GOAL_LABELS.get(m.get("dating_goal", "Open"), "☕ Dates & Explore")
-        v_badge = " ✅ [Verified]" if m.get("is_verified", 0) == 1 else ""
-
-        if my_shared and partner_shared:
-            contact = f"@{m['username']}" if m.get('username') else f"<a href='tg://user?id={m['telegram_id']}'>💬 Open Chat with {m['name']}</a>"
-            direct_url = f"https://t.me/{m['username']}" if m.get('username') else f"tg://user?id={m['telegram_id']}"
-            btn = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Open Chat on Telegram", url=direct_url)]])
-            status = f"🔓 <b>Contact Unlocked:</b> {contact}"
-        elif my_shared:
-            btn = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏳ Waiting for them to share", callback_data="noop")]])
-            status = "⏳ <i>You shared your handle. Waiting for them to share back.</i>"
-        else:
-            btn = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🤝 Share My Handle", callback_data=f"sharehandle_{m['telegram_id']}")]] )
-            status = "🔒 <i>Tap below to share your Telegram handle with them.</i>"
-
-        text = (
-            f"👤 <b>{m['name']}</b>{v_badge}, {m['age']} ({m['city']})\n"
-            f"🎯 <b>Goal:</b> {m_goal_label}\n"
-            f"❝ {m['bio']} ❞\n\n"
-            f"{status}"
-        )
-        await message.answer_photo(photo=m["photo_file_id"], caption=text, reply_markup=btn, parse_mode="HTML")
-
-@dp.callback_query(F.data == "noop")
-async def noop_handler(callback: types.CallbackQuery):
-    try:
-        await callback.answer("Waiting for them to share their handle back.")
-    except Exception:
-        pass
-
-# --- SWIPE HISTORY SYSTEM ---
-@dp.message(F.text == "📜 My History")
-@dp.message(Command("history"))
-async def show_history_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    user_id = message.from_user.id
-
-    liked_count = await db_fetchval("SELECT COUNT(*) FROM swipes WHERE swiper_id = ? AND action = 'like'", user_id)
-    passed_count = await db_fetchval("SELECT COUNT(*) FROM swipes WHERE swiper_id = ? AND action = 'pass'", user_id)
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"❤️ Liked Profiles ({liked_count})", callback_data="view_history_liked")],
-            [InlineKeyboardButton(text=f"❌ Passed Profiles ({passed_count})", callback_data="view_history_passed")]
+    quick_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 View Stats", callback_data="admin_quick_stats"),
+            InlineKeyboardButton(text="⏰ Nudge Incomplete", callback_data="admin_quick_nudge_inc")
+        ],
+        [
+            InlineKeyboardButton(text="⏳ Nudge Unverified", callback_data="admin_quick_nudge_unver")
         ]
-    )
+    ])
 
-    history_menu_text = (
-        f"📜 <b>YOUR SWIPE HISTORY:</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• ❤️ <b>Profiles You Liked:</b> {liked_count}\n"
-        f"• ❌ <b>Profiles You Passed:</b> {passed_count}\n\n"
-        f"Select a category below to review their cards:"
-    )
-    await message.answer(history_menu_text, reply_markup=keyboard, parse_mode="HTML")
+    await message.answer(admin_text, parse_mode="HTML", reply_markup=quick_kb)
 
-@dp.callback_query(F.data == "view_history_liked")
-async def view_history_liked_handler(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-
-    query = """
-        SELECT u.*, 
-               (SELECT COUNT(*) FROM matches m 
-                WHERE (m.user1_id = ? AND m.user2_id = u.telegram_id) 
-                   OR (m.user2_id = ? AND m.user1_id = u.telegram_id)) AS is_matched
-        FROM users u
-        JOIN swipes s ON u.telegram_id = s.target_id
-        WHERE s.swiper_id = ? AND s.action = 'like'
-        ORDER BY u.name ASC
-    """
-    liked_users = await db_fetchall(query, user_id, user_id, user_id)
-
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-
-    if not liked_users:
-        await callback.message.answer("❤️ <b>You haven't liked any profiles yet.</b>\nExplore in <b>🔍 Discover</b> to find matches!", parse_mode="HTML")
-        return
-
-    await callback.message.answer(f"❤️ <b>Profiles You Liked ({len(liked_users)}):</b>", parse_mode="HTML")
-
-    for u in liked_users:
-        status = "🎉 <b>Matched!</b>" if u.get("is_matched", 0) > 0 else "⏳ <i>Awaiting their response</i>"
-        st_str = u.get("state", "India") or "India"
-        ct_str = u.get("city", "Other") or "Other"
-        g_label = GOAL_LABELS.get(u.get("dating_goal", "Open"), "☕ Dates & Explore")
-        v_badge = " ✅ [Verified]" if u.get("is_verified", 0) == 1 else ""
-
-        card_text = (
-            f"👤 <b>{u['name'].upper()}</b>{v_badge}, {u['age']}\n"
-            f"📍 <i>{ct_str}, {st_str}</i>\n"
-            f"🎯 <b>Goal:</b> {g_label}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"❝ {u['bio']} ❞\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Status:</b> {status}"
-        )
-        await callback.message.answer_photo(photo=u["photo_file_id"], caption=card_text, parse_mode="HTML")
-
-@dp.callback_query(F.data == "view_history_passed")
-async def view_history_passed_handler(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-
-    query = """
-        SELECT u.* FROM users u
-        JOIN swipes s ON u.telegram_id = s.target_id
-        WHERE s.swiper_id = ? AND s.action = 'pass'
-        ORDER BY u.name ASC
-    """
-    passed_users = await db_fetchall(query, user_id)
-
-    try:
-        await callback.answer()
-    except Exception:
-        pass
-
-    if not passed_users:
-        await callback.message.answer("❌ <b>You haven't passed on any profiles.</b>", parse_mode="HTML")
-        return
-
-    await callback.message.answer(f"❌ <b>Profiles You Passed ({len(passed_users)}):</b>\n<i>You can tap Rewind to change your mind!</i>", parse_mode="HTML")
-
-    for u in passed_users:
-        st_str = u.get("state", "India") or "India"
-        ct_str = u.get("city", "Other") or "Other"
-        g_label = GOAL_LABELS.get(u.get("dating_goal", "Open"), "☕ Dates & Explore")
-        v_badge = " ✅ [Verified]" if u.get("is_verified", 0) == 1 else ""
-
-        rewind_kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="↩️ Rewind & Like", callback_data=f"rewind_like_{u['telegram_id']}")]]
-        )
-
-        card_text = (
-            f"👤 <b>{u['name'].upper()}</b>{v_badge}, {u['age']}\n"
-            f"📍 <i>{ct_str}, {st_str}</i>\n"
-            f"🎯 <b>Goal:</b> {g_label}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"❝ {u['bio']} ❞"
-        )
-        await callback.message.answer_photo(photo=u["photo_file_id"], caption=card_text, reply_markup=rewind_kb, parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("rewind_like_"))
-async def rewind_to_like(callback: types.CallbackQuery):
-    target_id = int(callback.data.replace("rewind_like_", ""))
-    swiper_id = callback.from_user.id
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    await db_execute("UPDATE swipes SET action = 'like' WHERE swiper_id = ? AND target_id = ?", swiper_id, target_id)
-    mutual = await db_fetchrow("SELECT * FROM swipes WHERE swiper_id = ? AND target_id = ? AND action = 'like'", target_id, swiper_id)
-
-    if mutual:
-        u1, u2 = min(swiper_id, target_id), max(swiper_id, target_id)
-        await db_execute(
-            "INSERT INTO matches (user1_id, user2_id, user1_shared, user2_shared, created_at) VALUES (?, ?, 0, 0, ?) ON CONFLICT DO NOTHING",
-            u1, u2, today
-        )
-
-        user_obj = await db_fetchrow("SELECT name FROM users WHERE telegram_id = ?", swiper_id)
-        target_obj = await db_fetchrow("SELECT name FROM users WHERE telegram_id = ?", target_id)
-
-        kb_to_target = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🤝 Share My Handle", callback_data=f"sharehandle_{swiper_id}")]]
-        )
-        kb_to_swiper = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🤝 Share My Handle", callback_data=f"sharehandle_{target_id}")]]
-        )
-
-        try:
-            await bot.send_message(
-                target_id,
-                f"🎉 <b>IT'S A MUTUAL MATCH!</b>\n━━━━━━━━━━━━━━━━━━━━━━\n<b>{user_obj['name']}</b> liked your profile back!\n\n<i>Tap Share below to exchange contacts.</i>",
-                reply_markup=kb_to_target,
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-        await callback.message.answer(
-            f"🎉 <b>IT'S A MUTUAL MATCH!</b>\n━━━━━━━━━━━━━━━━━━━━━━\nYou and <b>{target_obj['name']}</b> liked each other!\n\n<i>Tap Share below to exchange contacts.</i>",
-            reply_markup=kb_to_swiper,
-            parse_mode="HTML"
-        )
-
-    try:
-        await callback.answer("Rewound! Profile liked ❤️", show_alert=True)
-    except Exception:
-        pass
-
-# --- REPORT SYSTEM ---
-@dp.callback_query(F.data.startswith("report_"))
-async def report_user(callback: types.CallbackQuery, state: FSMContext):
-    reported_id = int(callback.data.replace("report_", ""))
-    swiper_id = callback.from_user.id
-
-    await db_execute("UPDATE users SET reports_count = reports_count + 1 WHERE telegram_id = ?", reported_id)
-    await db_execute(
-        "INSERT INTO swipes (swiper_id, target_id, action) VALUES (?, ?, 'pass') ON CONFLICT (swiper_id, target_id) DO UPDATE SET action = 'pass'",
-        swiper_id, reported_id
-    )
-
-    try:
-        await callback.answer("🚩 Profile reported and removed.", show_alert=True)
-    except Exception:
-        pass
-
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    await show_next_candidate(chat_id=callback.message.chat.id, user_id=swiper_id)
-
-# ==========================================
-# --- ADMIN CONTROL SUITE & MODERATION ---
-# ==========================================
-
-@dp.callback_query(F.data.startswith("adm_approve_"))
-async def admin_approve_callback(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "admin_quick_stats")
+async def cb_quick_stats(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    user_id = int(callback.data.replace("adm_approve_", ""))
+    await cmd_admin_stats(callback.message)
+    await callback.answer()
 
-    await db_execute("UPDATE users SET is_approved = 1, is_verified = 1, is_banned = 0 WHERE telegram_id = ?", user_id)
-
-    try:
-        await callback.answer("User Approved & Verified Badge Granted! ✅")
-        await callback.message.edit_caption(caption=f"{callback.message.caption}\n\n✅ <b>STATUS: APPROVED & VERIFIED BY ADMIN</b>", parse_mode="HTML")
-    except Exception:
-        pass
-
-    try:
-        menu = await get_main_menu(user_id)
-        await bot.send_message(
-            user_id,
-            "🎉 <b>Congratulations! Your profile has been manually verified and approved by our moderation team.</b>\n"
-            "You now have a <b>✅ Verified Badge</b> attached to your card!\n\n"
-            "Tap <b>🔍 Discover</b> to begin exploring real, authentic profiles.",
-            reply_markup=menu,
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logging.warning(f"Could not notify approved user: {e}")
-
-@dp.callback_query(F.data.startswith("adm_reject_"))
-async def admin_reject_callback(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "admin_quick_nudge_inc")
+async def cb_quick_nudge_inc(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    user_id = int(callback.data.replace("adm_reject_", ""))
+    await cmd_remind_incomplete(callback.message)
+    await callback.answer()
 
-    # Do not ban permanently; reset approval/verification and allow selfie retry
-    await db_execute("UPDATE users SET is_approved = 0, is_verified = 0, is_banned = 0 WHERE telegram_id = ?", user_id)
-
-    try:
-        await callback.answer("Verification Rejected. User asked to retry.")
-        await callback.message.edit_caption(
-            caption=f"{callback.message.caption}\n\n⚠️ <b>STATUS: VERIFICATION REJECTED (Allowed to retry)</b>", 
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-
-    retry_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="📸 Retake Verification Selfie", callback_data="retry_verification")
-        ]]
-    )
-
-    try:
-        await bot.send_message(
-            user_id,
-            "⚠️ <b>Verification Unsuccessful</b>\n\n"
-            "Your verification selfie did not clearly match the requested gesture pose or photo clarity standards.\n\n"
-            "Your account is <b>not banned</b>! Tap the button below to submit a clear verification selfie holding the requested pose.",
-            reply_markup=retry_kb,
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logging.warning(f"Could not notify rejected user: {e}")
-
-@dp.callback_query(F.data.startswith("adm_ban_"))
-async def admin_ban_callback(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "admin_quick_nudge_unver")
+async def cb_quick_nudge_unver(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    user_id = int(callback.data.replace("adm_ban_", ""))
+    await cmd_remind_unverified(callback.message)
+    await callback.answer()
 
-    await db_execute("UPDATE users SET is_approved = 0, is_verified = 0, is_banned = 1 WHERE telegram_id = ?", user_id)
+# ---------------------------------------------------------
+# Admin Suite: Reply System, User Inspector & Stats
+# ---------------------------------------------------------
+@dp.callback_query(F.data.startswith("admin_prep_reply_"))
+async def cb_admin_prep_reply(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    user_id = int(callback.data.split("_")[3])
+    await state.update_data(reply_target_id=user_id)
+    await state.set_state(AdminReplyState.waiting_for_reply)
+    await callback.message.reply(f"✍️ Type your official reply message for user <code>{user_id}</code>:")
+    await callback.answer()
 
-    try:
-        await callback.answer("User Banned Permanently! 🚫")
-        await callback.message.edit_caption(caption=f"{callback.message.caption}\n\n🚫 <b>STATUS: PERMANENTLY BANNED</b>", parse_mode="HTML")
-    except Exception:
-        pass
-
-    try:
-        await bot.send_message(
-            user_id,
-            "🚫 <b>Your account has been suspended for violating community guidelines.</b>",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-
-@dp.message(Command("admin_stats"))
-async def admin_stats_handler(message: types.Message):
+@dp.message(AdminReplyState.waiting_for_reply)
+async def process_admin_reply(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    data = await state.get_data()
+    target_id = data.get("reply_target_id")
+    reply_text = message.text
+    
+    try:
+        await bot.send_message(
+            target_id,
+            f"💌 <b>Message from Soulmate India Support:</b>\n\n{reply_text}",
+            parse_mode="HTML"
+        )
+        await message.answer(f"✅ Official reply delivered to <code>{target_id}</code>!", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Failed to deliver: {e}")
+    finally:
+        await state.clear()
 
-    total_users = await db_fetchval("SELECT COUNT(*) FROM users")
-    approved_users = await db_fetchval("SELECT COUNT(*) FROM users WHERE is_approved = 1 AND is_banned = 0")
-    verified_users = await db_fetchval("SELECT COUNT(*) FROM users WHERE is_verified = 1")
-    pending_users = await db_fetchval("SELECT COUNT(*) FROM users WHERE is_approved = 0 AND is_banned = 0")
-    banned_users = await db_fetchval("SELECT COUNT(*) FROM users WHERE is_banned = 1")
-    abandoned_users = await db_fetchval("""
-        SELECT COUNT(*) FROM pending_registrations p
-        LEFT JOIN users u ON p.telegram_id = u.telegram_id
-        WHERE u.telegram_id IS NULL
-    """)
-
-    gender_counts = await db_fetchall("SELECT gender, COUNT(*) AS c FROM users WHERE is_approved = 1 GROUP BY gender")
-    gender_text = "\n".join([f"  • {g['gender']}: {g['c']}" for g in gender_counts]) or "  • None"
-
-    goal_counts = await db_fetchall("SELECT dating_goal, COUNT(*) AS c FROM users WHERE is_approved = 1 GROUP BY dating_goal")
-    goal_text = "\n".join([f"  • {GOAL_LABELS.get(g['dating_goal'], g['dating_goal'])}: {g['c']}" for g in goal_counts]) or "  • None"
-
-    total_swipes = await db_fetchval("SELECT COUNT(*) FROM swipes")
-    total_matches = await db_fetchval("SELECT COUNT(*) FROM matches")
-
-    top_cities = await db_fetchall("SELECT city, COUNT(*) AS c FROM users WHERE is_approved = 1 GROUP BY city ORDER BY COUNT(*) DESC LIMIT 5")
-    cities_text = "\n".join([f"  • {city['city']}: {city['c']}" for city in top_cities]) or "  • None"
-
-    db_type = "Neon PostgreSQL (Cloud ☁️)" if pg_pool else "SQLite (Local File 📁)"
-
-    stats_msg = (
-        f"📊 <b>SOULMATE BOT ADMIN DASHBOARD</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💾 <b>Database Engine:</b> {db_type}\n"
-        f"👥 <b>Total Registrations:</b> {total_users}\n"
-        f"✅ <b>Approved & Live:</b> {approved_users}\n"
-        f"🛡️ <b>Verified Badge Holders:</b> {verified_users}\n"
-        f"⏳ <b>Pending Moderation:</b> {pending_users}\n"
-        f"🚪 <b>Incomplete Signups (Drop-offs):</b> {abandoned_users}\n"
-        f"🚫 <b>Banned Accounts:</b> {banned_users}\n\n"
-        f"🔥 <b>Total Swipes:</b> {total_swipes}\n"
-        f"🎉 <b>Total Mutual Matches:</b> {total_matches}\n\n"
-        f"🚻 <b>Gender Distribution:</b>\n{gender_text}\n\n"
-        f"🎯 <b>Dating Intentions:</b>\n{goal_text}\n\n"
-        f"🏙️ <b>Top Active Cities:</b>\n{cities_text}"
-    )
-    await message.answer(stats_msg, parse_mode="HTML")
-
-@dp.message(Command("ban"))
-async def admin_ban_handler(message: types.Message):
+@dp.message(Command("reply"))
+async def cmd_reply(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    parts = message.text.strip().split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Usage: <code>/ban &lt;user_id&gt;</code>", parse_mode="HTML")
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Usage: <code>/reply &lt;user_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    target_id = int(parts[1])
+    text = parts[2]
+    try:
+        await bot.send_message(
+            target_id,
+            f"💌 <b>Message from Soulmate India Support:</b>\n\n{text}",
+            parse_mode="HTML"
+        )
+        await message.answer(f"✅ Reply delivered to <code>{target_id}</code>!", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Failed: {e}")
+
+@dp.message(Command("notice"))
+async def cmd_notice(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Usage: <code>/notice &lt;telegram_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
         return
     
     target_id = int(parts[1])
-    await db_execute("UPDATE users SET is_banned = 1, is_approved = 0, is_verified = 0 WHERE telegram_id = ?", target_id)
-
-    await message.answer(f"🚫 User <code>{target_id}</code> has been banned.", parse_mode="HTML")
+    notice_text = parts[2]
+    
     try:
-        await bot.send_message(target_id, "🚫 <b>Your account has been suspended by the administrator.</b>", parse_mode="HTML")
+        await bot.send_message(
+            target_id,
+            f"📢 <b>Official Notice from Administration</b>\n\n{notice_text}",
+            parse_mode="HTML"
+        )
+        await message.answer(f"✅ Notice delivered to <code>{target_id}</code>!", parse_mode="HTML")
+    except TelegramForbiddenError:
+        await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", target_id)
+        await message.answer(f"❌ User <code>{target_id}</code> blocked the bot or account is deactivated. Soft-hidden.", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Failed to deliver: {e}")
+
+@dp.message(Command("user"))
+async def cmd_inspect_user(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/user &lt;telegram_id&gt;</code>", parse_mode="HTML")
+        return
+    user_id = int(parts[1])
+    await inspect_user_profile(user_id, message)
+
+@dp.callback_query(F.data.startswith("inspect_user_"))
+async def cb_inspect_user(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    user_id = int(callback.data.split("_")[2])
+    await inspect_user_profile(user_id, callback.message)
+    await callback.answer()
+
+async def inspect_user_profile(user_id: int, message_or_obj):
+    rows = await db_query("SELECT * FROM users WHERE telegram_id = ?", user_id)
+    if not rows:
+        await message_or_obj.reply(f"❌ User <code>{user_id}</code> not found in database.", parse_mode="HTML")
+        return
+    u = rows[0]
+
+    likes_given = (await db_query("SELECT COUNT(*) as c FROM swipes WHERE swiper_id = ? AND action = 'like'", user_id))[0]['c']
+    likes_received = (await db_query("SELECT COUNT(*) as c FROM swipes WHERE swiped_id = ? AND action = 'like'", user_id))[0]['c']
+    matches_cnt = (await db_query("SELECT COUNT(*) as c FROM matches WHERE user1_id = ? OR user2_id = ?", user_id, user_id))[0]['c']
+    reports_cnt = (await db_query("SELECT COUNT(*) as c FROM reports WHERE reported_id = ?", user_id))[0]['c']
+
+    user_link = safe_user_mention(u['telegram_id'], u['full_name'], u['username'])
+    details = (
+        f"🔍 <b>User Dossier:</b> {user_link}\n\n"
+        f"• <b>Telegram ID:</b> <code>{u['telegram_id']}</code>\n"
+        f"• <b>Age / Gender:</b> {u['age']} | {u['gender']} (Seeking: {u['target_gender']})\n"
+        f"• <b>City:</b> {u['city']}\n"
+        f"• <b>Verified:</b> {'Yes 🛡️' if u['is_verified'] else 'No ❌'}\n"
+        f"• <b>Active/Approved:</b> {'Yes 🟢' if u['is_approved'] else 'Paused ⚪'}\n"
+        f"• <b>Status:</b> {'🚫 BANNED' if u['is_banned'] else 'Normal'}\n"
+        f"• <b>Activity:</b> Given: {likes_given} ❤️ | Received: {likes_received} 💌\n"
+        f"• <b>Matches:</b> {matches_cnt} | <b>Reports Against:</b> {reports_cnt} 🚨\n\n"
+        f"📝 <b>Bio:</b> {u['bio']}"
+    )
+
+    action_buttons = []
+    if u['is_banned']:
+        action_buttons.append(InlineKeyboardButton(text="🟢 Unban", callback_data=f"admin_unban_{user_id}"))
+    else:
+        action_buttons.append(InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{user_id}"))
+    action_buttons.append(InlineKeyboardButton(text="💬 Message", callback_data=f"admin_prep_reply_{user_id}"))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[action_buttons])
+    await message_or_obj.reply_photo(u['photo_id'], caption=details, parse_mode="HTML", reply_markup=kb)
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/ban &lt;telegram_id&gt;</code>", parse_mode="HTML")
+        return
+    user_id = int(parts[1])
+    await db_execute("UPDATE users SET is_banned = 1, is_approved = 0 WHERE telegram_id = ?", user_id)
+    await message.answer(f"🚫 User <code>{user_id}</code> is now banned and removed from discovery.", parse_mode="HTML")
+    try:
+        await bot.send_message(user_id, "🚫 Your account has been suspended for violating our terms.")
     except Exception:
         pass
 
 @dp.message(Command("unban"))
-async def admin_unban_handler(message: types.Message):
+async def cmd_unban(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    parts = message.text.strip().split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Usage: <code>/unban &lt;user_id&gt;</code>", parse_mode="HTML")
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/unban &lt;telegram_id&gt;</code>", parse_mode="HTML")
         return
-    
-    target_id = int(parts[1])
-    # Unbans user, keeps them pending review so unban does not accidentally bypass moderation
-    await db_execute("UPDATE users SET is_banned = 0, is_approved = 0, is_verified = 0 WHERE telegram_id = ?", target_id)
+    user_id = int(parts[1])
+    await db_execute("UPDATE users SET is_banned = 0, is_approved = 1 WHERE telegram_id = ? AND is_verified = 1", user_id)
+    await message.answer(f"🟢 User <code>{user_id}</code> unbanned and restored to discovery.", parse_mode="HTML")
 
-    await message.answer(f"✅ User <code>{target_id}</code> unbanned. Moderation set back to pending review.", parse_mode="HTML")
+@dp.callback_query(F.data.startswith("admin_unban_"))
+async def cb_admin_unban(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    user_id = int(callback.data.split("_")[2])
+    await db_execute("UPDATE users SET is_banned = 0, is_approved = 1 WHERE telegram_id = ? AND is_verified = 1", user_id)
+    await callback.message.reply(f"🟢 User <code>{user_id}</code> unbanned.", parse_mode="HTML")
+    await callback.answer("Unbanned.")
 
-@dp.message(Command("reject"))
-async def admin_reject_handler(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+@dp.callback_query(F.data.startswith("admin_ban_"))
+async def cb_admin_ban(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
         return
-    parts = message.text.strip().split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Usage: <code>/reject &lt;user_id&gt;</code>", parse_mode="HTML")
-        return
-    
-    target_id = int(parts[1])
-    await db_execute("UPDATE users SET is_banned = 0, is_approved = 0, is_verified = 0 WHERE telegram_id = ?", target_id)
-    await message.answer(f"⚠️ User <code>{target_id}</code> unapproved and prompted for re-verification.", parse_mode="HTML")
-    
-    retry_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="📸 Retake Verification Selfie", callback_data="retry_verification")]]
-    )
+    user_id = int(callback.data.split("_")[2])
+    await db_execute("UPDATE users SET is_banned = 1, is_approved = 0 WHERE telegram_id = ?", user_id)
+    await callback.message.reply(f"🚫 User <code>{user_id}</code> banned and soft-hidden.", parse_mode="HTML")
     try:
-        await bot.send_message(
-            target_id,
-            "⚠️ <b>Verification Review Notice</b>\n\n"
-            "Please submit an updated verification selfie holding the requested pose by tapping below:",
-            reply_markup=retry_kb,
-            parse_mode="HTML"
-        )
+        await bot.send_message(user_id, "🚫 Your account has been suspended.")
     except Exception:
         pass
+    await callback.answer("Banned.")
 
-@dp.message(Command("notice"))
-async def admin_send_notice(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = message.text.strip().split(maxsplit=2)
-    if len(parts) < 3 or not parts[1].isdigit():
-        usage_text = (
-            "⚠️ <b>Usage:</b>\n"
-            "<code>/notice &lt;user_id&gt; &lt;your message&gt;</code>\n\n"
-            "<b>Example:</b>\n"
-            "<code>/notice 6825207373 Please resubmit your verification selfie holding the requested pose.</code>"
-        )
-        await message.answer(usage_text, parse_mode="HTML")
-        return
-
-    target_id = int(parts[1])
-    notice_text = parts[2]
-
-    target_user = await db_fetchrow("SELECT name FROM users WHERE telegram_id = ?", target_id)
-    recipient_name = target_user['name'] if target_user else "Member"
-
-    formatted_alert = (
-        f"📢 <b>OFFICIAL MODERATION NOTICE</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Hello <b>{recipient_name}</b>,\n\n"
-        f"{notice_text}\n\n"
-        f"<i>— Soulmate India Moderation Team</i>"
-    )
-
-    try:
-        await bot.send_message(target_id, formatted_alert, parse_mode="HTML")
-        await message.answer(
-            f"✅ <b>Notice delivered!</b>\n\n"
-            f"• <b>Recipient:</b> {recipient_name} (<code>{target_id}</code>)\n"
-            f"• <b>Message:</b> <i>{notice_text}</i>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await message.answer(
-            f"❌ <b>Delivery failed:</b> User <code>{target_id}</code> blocked the bot or disabled DMs.\nError: <code>{e}</code>",
-            parse_mode="HTML"
-        )
-
-@dp.message(Command("remind_unverified"))
-async def admin_remind_unverified(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    users = await db_fetchall("SELECT telegram_id, name FROM users WHERE is_approved = 0 AND is_banned = 0")
-    if not users:
-        await message.answer("✅ No users currently pending verification.")
-        return
-
-    status_msg = await message.answer(f"⏳ Sending verification reminders to {len(users)} users...")
-    sent, failed = 0, 0
-
-    retry_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="📸 Submit Verification Selfie", callback_data="retry_verification")]]
-    )
-
-    for u in users:
-        reminder_text = (
-            f"👋 Hi <b>{u['name']}</b>,\n\n"
-            "Your profile on <b>Soulmate India</b> is currently pending verification! 🛡️\n\n"
-            "To unlock profile browsing and start matching with verified singles nearby, please complete your quick gesture selfie check.\n\n"
-            "Tap below to submit your selfie:"
-        )
-        try:
-            await bot.send_message(u["telegram_id"], reminder_text, reply_markup=retry_kb, parse_mode="HTML")
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-
-    await status_msg.edit_text(
-        f"✅ <b>Verification Reminders Dispatched!</b>\n\n"
-        f"• 📬 Delivered: {sent}\n"
-        f"• 🚫 Failed / Blocked: {failed}",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("remind_incomplete"))
-async def admin_remind_incomplete(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    incomplete = await db_fetchall("""
-        SELECT p.telegram_id 
-        FROM pending_registrations p
-        LEFT JOIN users u ON p.telegram_id = u.telegram_id
-        WHERE u.telegram_id IS NULL
-    """)
-
-    if not incomplete:
-        await message.answer("✅ No abandoned registrations found.")
-        return
-
-    bot_info = await bot.get_me()
-    status_msg = await message.answer(f"⏳ Sending onboarding completion reminders to {len(incomplete)} users...")
-    sent, failed = 0, 0
-
-    start_kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="✨ Finish Setting Up Profile", url=f"https://t.me/{bot_info.username}?start=resume")
-        ]]
-    )
-
-    for row in incomplete:
-        uid = row["telegram_id"]
-        reminder_text = (
-            "✨ <b>You're almost there!</b>\n\n"
-            "You started setting up your profile on <b>Soulmate India</b> but didn't finish.\n\n"
-            "It takes less than 60 seconds to complete your profile and start discovering authentic matches in your city.\n\n"
-            "Tap below to pick up right where you left off!"
-        )
-        try:
-            await bot.send_message(uid, reminder_text, reply_markup=start_kb, parse_mode="HTML")
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-
-    await status_msg.edit_text(
-        f"✅ <b>Onboarding Reminders Dispatched!</b>\n\n"
-        f"• 📬 Delivered: {sent}\n"
-        f"• 🚫 Failed / Blocked: {failed}",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("user"))
-async def admin_inspect_user(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    parts = message.text.strip().split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Usage: <code>/user &lt;user_id&gt;</code>", parse_mode="HTML")
-        return
-
-    target_id = int(parts[1])
-    u = await db_fetchrow("SELECT * FROM users WHERE telegram_id = ?", target_id)
-
-    if not u:
-        await message.answer(f"User <code>{target_id}</code> not found.", parse_mode="HTML")
-        return
-
-    status = "🚫 BANNED" if u.get("is_banned", 0) == 1 else ("✅ APPROVED & VERIFIED" if u.get("is_verified", 0) == 1 else "⏳ PENDING")
-    handle_str = f"@{u['username']}" if u.get('username') else f"<a href='tg://user?id={u['telegram_id']}'>Direct Telegram Link</a>"
-    inspect_text = (
-        f"🔍 <b>USER DOSSIER: {u['name'].upper()}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 <b>Telegram ID:</b> <code>{u['telegram_id']}</code>\n"
-        f"🔗 <b>Contact Link:</b> {handle_str}\n"
-        f"📞 <b>Phone:</b> <code>{u.get('phone_number', '')}</code>\n"
-        f"🛡️ <b>Status:</b> {status}\n"
-        f"🚩 <b>Reports:</b> {u.get('reports_count', 0)}\n"
-        f"📍 <b>Location:</b> {u.get('city', 'Other')}, {u.get('state', 'India')}\n"
-        f"🚻 <b>Gender:</b> {u.get('gender', '')} | 🎯 <b>Seeking:</b> {u.get('target_gender', 'Everyone')}\n"
-        f"🎯 <b>Goal:</b> {GOAL_LABELS.get(u.get('dating_goal', 'Open'), u.get('dating_goal', 'Open'))}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"❝ {u.get('bio', '')} ❞"
-    )
-    if u.get("photo_file_id"):
-        await message.answer_photo(photo=u["photo_file_id"], caption=inspect_text, parse_mode="HTML")
-    else:
-        await message.answer(inspect_text, parse_mode="HTML")
-
+# ---------------------------------------------------------
+# Segmented & Global Broadcasts
+# ---------------------------------------------------------
 @dp.message(Command("broadcast"))
-async def start_broadcast(message: types.Message, state: FSMContext):
+async def cmd_broadcast(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    await message.answer(
-        "📢 <b>ADMIN BROADCAST MODE</b>\n\n"
-        "Send the text or photo message you want to broadcast to all approved users.\n"
-        "Send /cancel at any time to abort.",
-        parse_mode="HTML"
-    )
-    await state.set_state(AdminStates.broadcast_message)
+    text = message.text.replace("/broadcast", "", 1).strip()
+    if not text:
+        await message.answer("Usage: <code>/broadcast &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    users = await db_query("SELECT telegram_id FROM users WHERE is_banned = 0")
+    await run_broadcast(users, text, message)
 
-@dp.message(Command("cancel"), AdminStates.broadcast_message)
-async def cancel_broadcast(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer("❌ Broadcast cancelled.")
+@dp.message(Command("broadcast_city"))
+async def cmd_broadcast_city(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Usage: <code>/broadcast_city &lt;City&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    city, text = parts[1].strip().title(), parts[2].strip()
+    users = await db_query("SELECT telegram_id FROM users WHERE LOWER(city) = LOWER(?) AND is_banned = 0", city)
+    await run_broadcast(users, text, message, target_desc=f"City: {city}")
 
-@dp.message(AdminStates.broadcast_message)
-async def execute_broadcast(message: types.Message, state: FSMContext):
-    broadcast_text = message.text or message.caption or ""
-    photo_file_id = message.photo[-1].file_id if message.photo else None
-    await state.clear()
+@dp.message(Command("broadcast_gender"))
+async def cmd_broadcast_gender(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Usage: <code>/broadcast_gender &lt;Male|Female&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    gender, text = parts[1].strip().title(), parts[2].strip()
+    users = await db_query("SELECT telegram_id FROM users WHERE gender = ? AND is_banned = 0", gender)
+    await run_broadcast(users, text, message, target_desc=f"Gender: {gender}")
 
-    rows = await db_fetchall("SELECT telegram_id FROM users WHERE is_approved = 1 AND is_banned = 0")
-    user_ids = [r["telegram_id"] for r in rows]
-
-    status_msg = await message.answer(f"⏳ Broadcasting to {len(user_ids)} approved members...")
+async def run_broadcast(users, text, admin_msg, target_desc="All Users"):
     sent, blocked = 0, 0
-
-    for uid in user_ids:
+    for u in users:
+        uid = u["telegram_id"]
         try:
-            if photo_file_id:
-                await bot.send_photo(uid, photo=photo_file_id, caption=broadcast_text, parse_mode="HTML")
-            else:
-                await bot.send_message(uid, broadcast_text, parse_mode="HTML")
+            await bot.send_message(uid, text, parse_mode="HTML")
             sent += 1
             await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            blocked += 1
+            await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", uid)
         except Exception:
             blocked += 1
 
-    await status_msg.edit_text(
-        f"✅ <b>Broadcast Completed!</b>\n\n"
-        f"• 📬 Successfully Delivered: {sent}\n"
-        f"• 🚫 Blocked / Failed: {blocked}",
+    await admin_msg.answer(
+        f"✅ <b>Broadcast Completed! ({target_desc})</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked/Failed: {blocked}",
         parse_mode="HTML"
     )
 
-# --- DUMMY HTTP SERVER FOR RENDER $0 FREE WEB SERVICE ---
-async def health_check(request):
-    return web.Response(text="Soulmate India Bot is online and running 24/7 on Render & Neon PostgreSQL!")
+# ---------------------------------------------------------
+# Admin Stats & Reminders
+# ---------------------------------------------------------
+@dp.message(Command("admin_stats"))
+async def cmd_admin_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    users_cnt = (await db_query("SELECT COUNT(*) as c FROM users"))[0]['c']
+    verified_cnt = (await db_query("SELECT COUNT(*) as c FROM users WHERE is_verified = 1"))[0]['c']
+    approved_cnt = (await db_query("SELECT COUNT(*) as c FROM users WHERE is_approved = 1"))[0]['c']
+    pending_verif = (await db_query("SELECT COUNT(*) as c FROM users WHERE is_verified = 0 AND is_banned = 0"))[0]['c']
+    dropoffs = (await db_query("""
+        SELECT COUNT(*) as c FROM pending_registrations p 
+        LEFT JOIN users u ON p.telegram_id = u.telegram_id 
+        WHERE u.telegram_id IS NULL
+    """))[0]['c']
+    matches_cnt = (await db_query("SELECT COUNT(*) as c FROM matches"))[0]['c']
+    swipes_cnt = (await db_query("SELECT COUNT(*) as c FROM swipes"))[0]['c']
+    feedback_cnt = (await db_query("SELECT COUNT(*) as c FROM feedback"))[0]['c']
+    reports_cnt = (await db_query("SELECT COUNT(*) as c FROM reports"))[0]['c']
+
+    engine_label = "Neon PostgreSQL (Cloud ☁️)" if is_postgres else "SQLite (Local File 📁)"
+
+    stats_msg = (
+        f"📊 <b>Soulmate India Administration Dashboard</b>\n\n"
+        f"💾 <b>Database Engine:</b> {engine_label}\n"
+        f"👥 <b>Total Registered:</b> {users_cnt}\n"
+        f"🛡️ <b>Verified Profiles:</b> {verified_cnt}\n"
+        f"🟢 <b>Active in Discovery:</b> {approved_cnt}\n"
+        f"⏳ <b>Awaiting Verification:</b> {pending_verif}\n"
+        f"🚪 <b>Drop-offs:</b> {dropoffs}\n"
+        f"❤️ <b>Total Swipes:</b> {swipes_cnt}\n"
+        f"💍 <b>Total Matches:</b> {matches_cnt}\n"
+        f"💬 <b>Feedback Submissions:</b> {feedback_cnt}\n"
+        f"🚨 <b>Total Reports Logged:</b> {reports_cnt}"
+    )
+    await message.answer(stats_msg, parse_mode="HTML")
+
+@dp.message(Command("remind_unverified"))
+async def cmd_remind_unverified(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    rows = await db_query("SELECT telegram_id FROM users WHERE is_verified = 0 AND is_banned = 0")
+    if not rows:
+        await message.answer("✅ No users currently pending verification.")
+        return
+    sent, blocked = 0, 0
+    for r in rows:
+        uid = r["telegram_id"]
+        try:
+            await bot.send_message(
+                uid,
+                "⏳ <b>Your Soulmate India Profile is Under Review</b>\n\n"
+                "Our team is currently verifying your gesture selfie. You'll be ready to discover matches very soon!",
+                parse_mode="HTML"
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            blocked += 1
+            await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", uid)
+        except Exception:
+            blocked += 1
+    await message.answer(f"✅ <b>Reminders Complete!</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked: {blocked}", parse_mode="HTML")
+
+@dp.message(Command("remind_incomplete"))
+async def cmd_remind_incomplete(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    dropoffs = await db_query("""
+        SELECT p.telegram_id FROM pending_registrations p
+        LEFT JOIN users u ON p.telegram_id = u.telegram_id
+        WHERE u.telegram_id IS NULL
+    """)
+    if not dropoffs:
+        await message.answer("✅ No incomplete signups found.")
+        return
+    sent, blocked = 0, 0
+    for d in dropoffs:
+        uid = d["telegram_id"]
+        try:
+            await bot.send_message(
+                uid,
+                "✨ <b>You're almost there!</b>\n\n"
+                "You started setting up your profile on <b>Soulmate India</b> but didn't finish.\n"
+                "Tap /start to complete your profile in 60 seconds and find genuine matches!",
+                parse_mode="HTML"
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            blocked += 1
+            await db_execute("DELETE FROM pending_registrations WHERE telegram_id = ?", uid)
+        except Exception:
+            blocked += 1
+    await message.answer(f"✅ <b>Drop-off Reminders Complete!</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked: {blocked}", parse_mode="HTML")
+
+# ---------------------------------------------------------
+# Embedded Web Server (Port Binding for Render)
+# ---------------------------------------------------------
+async def handle_health(request):
+    return web.Response(text="Soulmate India Bot is healthy!", status=200)
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logging.info(f"Render Web Server started on port {port}")
+    logger.info(f"Render Web Server bound to port {PORT}")
 
-# --- STARTUP RUNNER ---
+# ---------------------------------------------------------
+# Application Entrypoint
+# ---------------------------------------------------------
 async def main():
     await init_db()
     await start_web_server()
-    print("Bot is live with Neon PostgreSQL, Anti-Fake Gestures, Viral 1-Hour Boosts & Render Free Hosting...")
-    await dp.start_polling(bot, drop_pending_updates=True)
+
+    # Register private admin command menu visible ONLY to your account
+    admin_commands = [
+        BotCommand(command="admin", description="🛠️ Admin Control Center & Cheat Sheet"),
+        BotCommand(command="admin_stats", description="📊 System & Database Metrics"),
+        BotCommand(command="remind_incomplete", description="🚪 Nudge Registration Drop-offs"),
+        BotCommand(command="remind_unverified", description="⏳ Nudge Pending Approvals"),
+        BotCommand(command="broadcast", description="📢 Global Announcement"),
+    ]
+    try:
+        await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    except Exception as e:
+        logger.warning(f"Could not register admin command menu: {e}")
+
+    logger.info("Bot is live with Neon PostgreSQL, Anti-Fake Gestures, and Render Web Server...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")
