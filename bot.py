@@ -72,7 +72,7 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     """Calculates distance between two GPS coordinates in Kilometers."""
     if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
         return None
-    R = 6371.0  # Earth's mean radius in km
+    R = 6371.0  # Earth radius in km
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = (math.sin(dlat / 2) ** 2 +
@@ -100,7 +100,7 @@ async def init_db():
                 ssl="require" if "neon.tech" in pg_url else None
             )
             is_postgres = True
-            logger.info("✅ SUCCESS: Connected to Neon PostgreSQL (Persistent Queues Ready)!")
+            logger.info("✅ SUCCESS: Connected to Neon PostgreSQL!")
         except Exception as e:
             logger.error(f"❌ Failed to connect to Neon PostgreSQL: {e}")
             logger.warning("Falling back to local SQLite storage...")
@@ -118,7 +118,8 @@ async def init_db():
             age INT,
             gender TEXT,
             target_gender TEXT,
-            city TEXT,
+            country TEXT,
+            state TEXT,
             latitude DOUBLE PRECISION,
             longitude DOUBLE PRECISION,
             bio TEXT,
@@ -159,7 +160,8 @@ async def init_db():
             user_id BIGINT PRIMARY KEY,
             gender TEXT,
             target_gender TEXT,
-            city TEXT,
+            country TEXT,
+            state TEXT,
             mode TEXT,
             joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -188,6 +190,24 @@ async def init_db():
     if is_postgres:
         async with db_pool.acquire() as conn:
             await conn.execute(schema)
+            # Automatic schema migration for country and state
+            await conn.execute("""
+                DO $$ 
+                BEGIN 
+                    BEGIN
+                        ALTER TABLE users ADD COLUMN country TEXT;
+                    EXCEPTION WHEN duplicate_column THEN END;
+                    BEGIN
+                        ALTER TABLE users ADD COLUMN state TEXT;
+                    EXCEPTION WHEN duplicate_column THEN END;
+                    BEGIN
+                        ALTER TABLE roulette_queue ADD COLUMN country TEXT;
+                    EXCEPTION WHEN duplicate_column THEN END;
+                    BEGIN
+                        ALTER TABLE roulette_queue ADD COLUMN state TEXT;
+                    EXCEPTION WHEN duplicate_column THEN END;
+                END $$;
+            """)
     else:
         sqlite_schema = (schema
                          .replace("BIGINT", "INTEGER")
@@ -198,7 +218,6 @@ async def init_db():
             await db.commit()
 
 async def db_execute(query: str, *args):
-    """Executes query using '?' parameter placeholders."""
     if is_postgres:
         parts = query.split("?")
         pg_query = parts[0]
@@ -212,7 +231,6 @@ async def db_execute(query: str, *args):
             await db.commit()
 
 async def db_query(query: str, *args):
-    """Executes SELECT query and returns rows as dictionaries."""
     if is_postgres:
         parts = query.split("?")
         pg_query = parts[0]
@@ -236,8 +254,9 @@ class Registration(StatesGroup):
     age = State()
     gender = State()
     target_gender = State()
-    location_choice = State()
-    city = State()
+    mandatory_gps = State()
+    country = State()
+    state_province = State()
     bio = State()
     photo = State()
     gesture_selfie = State()
@@ -254,26 +273,18 @@ class AdminReplyState(StatesGroup):
 class EditProfileState(StatesGroup):
     editing_photo = State()
     editing_bio = State()
-    editing_city = State()
+    editing_location = State()
 
 # ---------------------------------------------------------
 # Sanitization & Helper Functions
 # ---------------------------------------------------------
 def is_valid_name(name: str) -> bool:
     name = name.strip()
-    if not (2 <= len(name) <= 32):
-        return False
-    if not re.match(r"^[A-Za-z\s.'-]+$", name):
-        return False
-    return bool(re.findall(r"[aeiouAEIOU]", name))
+    return 2 <= len(name) <= 32 and bool(re.match(r"^[A-Za-z\s.'-]+$", name)) and bool(re.findall(r"[aeiouAEIOU]", name))
 
-def is_valid_city(city: str) -> bool:
-    city = city.strip()
-    if not (2 <= len(city) <= 35):
-        return False
-    if not re.match(r"^[A-Za-z\s.-]+$", city):
-        return False
-    return bool(re.findall(r"[aeiouAEIOU]", city))
+def is_valid_text(val: str) -> bool:
+    val = val.strip()
+    return 2 <= len(val) <= 40 and bool(re.match(r"^[A-Za-z\s.-]+$", val))
 
 def safe_user_mention(user_id: int, full_name: str, username: str = None) -> str:
     if username:
@@ -300,7 +311,7 @@ def anon_chat_keyboard():
     )
 
 # ---------------------------------------------------------
-# Telegram Lifecycle Management (Zero Data Loss)
+# Lifecycle Management (Zero Data Loss)
 # ---------------------------------------------------------
 @dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=KICKED))
 async def handle_user_blocked(event: types.ChatMemberUpdated):
@@ -317,7 +328,7 @@ async def handle_user_unblocked(event: types.ChatMemberUpdated):
     await db_execute("UPDATE users SET is_approved = 1 WHERE telegram_id = ? AND is_verified = 1 AND is_banned = 0", user_id)
 
 # ---------------------------------------------------------
-# User Registration Flow
+# Mandatory GPS + Country/State Onboarding Flow
 # ---------------------------------------------------------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -332,9 +343,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
         if not u["is_approved"] and u["is_verified"]:
             await db_execute("UPDATE users SET is_approved = 1 WHERE telegram_id = ?", user_id)
 
+        loc_label = f"{u.get('state', '')}, {u.get('country', '')}".strip(", ") or "GPS Verified"
         await message.answer(
             f"✨ <b>Welcome back, {u['full_name']}!</b>\n"
-            f"📍 Location: <b>{u['city']}</b> | ⭐ Karma: <b>{u['karma_score']} pts</b>",
+            f"📍 Location: <b>{loc_label}</b> | ⭐ Karma: <b>{u['karma_score']} pts</b>",
             parse_mode="HTML",
             reply_markup=main_menu_keyboard()
         )
@@ -394,52 +406,73 @@ async def process_target_gender(message: types.Message, state: FSMContext):
         await message.answer("Please select an option using the keyboard.")
         return
     await state.update_data(target_gender=message.text)
-    await state.set_state(Registration.location_choice)
+    await state.set_state(Registration.mandatory_gps)
 
-    loc_kb = ReplyKeyboardMarkup(
+    # MANDATORY GPS LOCATION ONLY - NO MANUAL CITY OPTION
+    gps_kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🛰️ Share Live Location (For Distance in KM)", request_location=True)],
-            [KeyboardButton(text="✍️ Enter City Manually")]
+            [KeyboardButton(text="🛰️ Share Live Location (Mandatory for Proximity)", request_location=True)]
         ],
         resize_keyboard=True,
         one_time_keyboard=True
     )
     await message.answer(
-        "📍 <b>Location & Proximity Setup</b>\n\n"
-        "You can share your live GPS location to discover matches sorted by <b>exact distance (km)</b>, "
-        "or enter your city manually.",
+        "📍 <b>GPS Verification (Mandatory):</b>\n\n"
+        "To ensure zero fake location spoofing and show accurate distance in kilometers, "
+        "please tap the button below to share your live GPS location.",
         parse_mode="HTML",
-        reply_markup=loc_kb
+        reply_markup=gps_kb
     )
 
-@dp.message(Registration.location_choice, F.location)
-async def process_location_gps(message: types.Message, state: FSMContext):
+@dp.message(Registration.mandatory_gps, F.location)
+async def process_mandatory_gps(message: types.Message, state: FSMContext):
     lat = message.location.latitude
     lon = message.location.longitude
-    await state.update_data(latitude=lat, longitude=lon, city="GPS Located")
-    await state.set_state(Registration.bio)
-    await message.answer("🛰️ <b>GPS Locked!</b> Now write a short bio about yourself (hobbies, passions, what you seek):", parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    await state.update_data(latitude=lat, longitude=lon)
+    await state.set_state(Registration.country)
+    await message.answer(
+        "🛰️ <b>GPS Coordinates Verified!</b>\n\n"
+        "What is your <b>Nationality / Country</b>? (e.g. India, United States, United Kingdom, UAE):",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove()
+    )
 
-@dp.message(Registration.location_choice, F.text == "✍️ Enter City Manually")
-async def process_location_manual_prompt(message: types.Message, state: FSMContext):
-    await state.set_state(Registration.city)
-    await message.answer("Which city are you located in? (e.g. Bengaluru, Mumbai, Delhi, London):", reply_markup=ReplyKeyboardRemove())
+@dp.message(Registration.mandatory_gps)
+async def process_mandatory_gps_invalid(message: types.Message):
+    gps_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🛰️ Share Live Location (Mandatory for Proximity)", request_location=True)]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer("⚠️ You must tap <b>🛰️ Share Live Location</b> to proceed.", parse_mode="HTML", reply_markup=gps_kb)
 
-@dp.message(Registration.city)
-async def process_city(message: types.Message, state: FSMContext):
-    city = message.text.strip().title()
-    if not is_valid_city(city):
-        await message.answer("⚠️ <b>Invalid city.</b> Please enter a valid city name.", parse_mode="HTML")
+@dp.message(Registration.country)
+async def process_country(message: types.Message, state: FSMContext):
+    country = message.text.strip().title()
+    if not is_valid_text(country):
+        await message.answer("⚠️ Please enter a valid country name (letters only).")
         return
-    await state.update_data(city=city, latitude=None, longitude=None)
+    await state.update_data(country=country)
+    await state.set_state(Registration.state_province)
+    await message.answer(f"Got it, {country}! Now enter your <b>State / Province</b> (e.g. Jharkhand, Maharashtra, California, Ontario):", parse_mode="HTML")
+
+@dp.message(Registration.state_province)
+async def process_state(message: types.Message, state: FSMContext):
+    state_prov = message.text.strip().title()
+    if not is_valid_text(state_prov):
+        await message.answer("⚠️ Please enter a valid state/province name (letters only).")
+        return
+    await state.update_data(state=state_prov)
     await state.set_state(Registration.bio)
-    await message.answer("Write a short bio about yourself (interests, hobbies, what you are looking for):")
+    await message.answer("Write a short bio about yourself (your passions, lifestyle, hobbies):")
 
 @dp.message(Registration.bio)
 async def process_bio(message: types.Message, state: FSMContext):
     bio_text = message.text.strip()
     if len(bio_text) < 5 or len(bio_text) > 400:
-        await message.answer("⚠️ Please write a brief bio between 5 and 400 characters.")
+        await message.answer("⚠️ Bio must be between 5 and 400 characters.")
         return
     await state.update_data(bio=bio_text)
     await state.set_state(Registration.photo)
@@ -452,14 +485,28 @@ async def process_photo(message: types.Message, state: FSMContext):
     await state.set_state(Registration.gesture_selfie)
     await message.answer(
         "✌️ <b>Anti-Fake Verification Step</b>\n\n"
-        "To earn the <b>Blue Shield Badge 🛡️</b> and prevent catfishing, upload a selfie holding up a <b>Peace Sign (✌️)</b>.\n"
-        "<i>This photo is confidential and never shown publicly on your profile.</i>",
+        "To earn the <b>Blue Shield Badge 🛡️</b> and prevent catfishing, upload a selfie holding up a <b>Peace Sign (✌️)</b>.\n\n"
+        "<i>Send as photo or file. This photo is strictly confidential and is never shown publicly on your profile.</i>",
         parse_mode="HTML"
     )
 
-@dp.message(Registration.gesture_selfie, F.photo)
+@dp.message(Registration.photo)
+async def process_photo_invalid(message: types.Message):
+    await message.answer("⚠️ Please upload an image photo for your profile.")
+
+# FIXED: Handles both standard photo uploads and uncompressed image document attachments
+@dp.message(Registration.gesture_selfie, F.photo | F.document)
 async def process_gesture_selfie(message: types.Message, state: FSMContext):
-    gesture_photo_id = message.photo[-1].file_id
+    gesture_photo_id = None
+    if message.photo:
+        gesture_photo_id = message.photo[-1].file_id
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        gesture_photo_id = message.document.file_id
+
+    if not gesture_photo_id:
+        await message.answer("⚠️ Please send an actual image holding up a Peace Sign (✌️).")
+        return
+
     data = await state.get_data()
     user_id = message.from_user.id
     username = message.from_user.username or ""
@@ -467,16 +514,17 @@ async def process_gesture_selfie(message: types.Message, state: FSMContext):
     await db_execute("""
         INSERT INTO users (
             telegram_id, full_name, username, age, gender, target_gender,
-            city, latitude, longitude, bio, photo_id, gesture_photo_id,
+            country, state, latitude, longitude, bio, photo_id, gesture_photo_id,
             karma_score, is_verified, is_approved, is_banned
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, 0, 0, 0)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, 0, 0, 0)
         ON CONFLICT (telegram_id) DO UPDATE SET
             full_name = EXCLUDED.full_name,
             username = EXCLUDED.username,
             age = EXCLUDED.age,
             gender = EXCLUDED.gender,
             target_gender = EXCLUDED.target_gender,
-            city = EXCLUDED.city,
+            country = EXCLUDED.country,
+            state = EXCLUDED.state,
             latitude = EXCLUDED.latitude,
             longitude = EXCLUDED.longitude,
             bio = EXCLUDED.bio,
@@ -485,19 +533,20 @@ async def process_gesture_selfie(message: types.Message, state: FSMContext):
             is_verified = 0,
             is_approved = 0
     """, user_id, data['full_name'], username, data['age'], data['gender'],
-       data['target_gender'], data['city'], data.get('latitude'), data.get('longitude'),
+       data['target_gender'], data['country'], data['state'], data['latitude'], data['longitude'],
        data['bio'], data['photo_id'], gesture_photo_id)
 
     await db_execute("DELETE FROM pending_registrations WHERE telegram_id = ?", user_id)
     await state.clear()
 
     await message.answer(
-        "🎉 <b>Profile Submitted for Verification!</b>\n\n"
-        "Our moderators are verifying your gesture selfie. You'll receive a notification here once approved!",
+        "🎉 <b>Profile & Gesture Selfie Received!</b>\n\n"
+        "Our moderators are reviewing your peace sign gesture selfie. You'll receive a confirmation notice as soon as your profile is verified!",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard()
     )
 
+    # Alert Admin
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Approve", callback_data=f"verify_ok_{user_id}"),
@@ -510,7 +559,7 @@ async def process_gesture_selfie(message: types.Message, state: FSMContext):
         f"🚨 <b>New Profile Verification Request</b>\n\n"
         f"👤 <b>User:</b> {user_link} (<code>{user_id}</code>)\n"
         f"🎂 <b>Age/Gender:</b> {data['age']} | {data['gender']} (Seeking: {data['target_gender']})\n"
-        f"📍 <b>Location:</b> {data['city']}\n"
+        f"📍 <b>Location:</b> {data['state']}, {data['country']}\n"
         f"📝 <b>Bio:</b> {data['bio']}"
     )
 
@@ -524,6 +573,10 @@ async def process_gesture_selfie(message: types.Message, state: FSMContext):
         )
     except Exception as e:
         logger.error(f"Failed to deliver verification alert to admin: {e}")
+
+@dp.message(Registration.gesture_selfie)
+async def fallback_gesture_selfie(message: types.Message):
+    await message.answer("⚠️ Please send a <b>photo</b> showing your face holding up a Peace Sign (✌️) to finish verification.", parse_mode="HTML")
 
 # ---------------------------------------------------------
 # Verification Callbacks & Selfie Retake Flow
@@ -541,7 +594,7 @@ async def callback_verify_ok(callback: types.CallbackQuery):
         await bot.send_message(
             user_id,
             "🎉 <b>Congratulations! Your profile is verified!</b>\n\n"
-            "You've received your Blue Verified Badge 🛡️. Tap <b>🔍 Discover (Proximity)</b> to meet singles!",
+            "You've received your Blue Verified Badge 🛡️. Tap <b>🔍 Discover (Proximity)</b> to meet singles nearby!",
             parse_mode="HTML"
         )
     except Exception:
@@ -579,9 +632,18 @@ async def callback_start_retake(callback: types.CallbackQuery, state: FSMContext
     await callback.message.answer("📸 Upload your new verification selfie holding up a <b>Peace Sign (✌️)</b>:", parse_mode="HTML")
     await callback.answer()
 
-@dp.message(RetakeSelfie.waiting_for_photo, F.photo)
+@dp.message(RetakeSelfie.waiting_for_photo, F.photo | F.document)
 async def process_retake_photo(message: types.Message, state: FSMContext):
-    gesture_photo_id = message.photo[-1].file_id
+    gesture_photo_id = None
+    if message.photo:
+        gesture_photo_id = message.photo[-1].file_id
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        gesture_photo_id = message.document.file_id
+
+    if not gesture_photo_id:
+        await message.answer("⚠️ Please send an image photo.")
+        return
+
     user_id = message.from_user.id
     username = message.from_user.username or ""
 
@@ -617,10 +679,11 @@ async def cmd_my_profile(message: types.Message):
     u = rows[0]
     badge = "🛡️ Verified" if u["is_verified"] else "⏳ Under Review"
     status = "Visible 🟢" if u["is_approved"] else "Hidden / Paused ⚪"
+    loc_label = f"{u.get('state', '')}, {u.get('country', '')}".strip(", ") or "GPS Stored"
     
     caption = (
         f"👤 <b>{u['full_name']}</b>, {u['age']}\n"
-        f"📍 <b>Location:</b> {u['city']}\n"
+        f"📍 <b>Location:</b> {loc_label}\n"
         f"🎯 <b>Looking For:</b> {u['target_gender']}\n"
         f"⭐ <b>Karma Score:</b> {u['karma_score']} pts\n"
         f"🛡️ <b>Badge:</b> {badge}\n"
@@ -633,10 +696,9 @@ async def cmd_my_profile(message: types.Message):
             InlineKeyboardButton(text="📝 Edit Bio", callback_data="edit_prof_bio")
         ],
         [
-            InlineKeyboardButton(text="📍 Update City", callback_data="edit_prof_city"),
-            InlineKeyboardButton(text="🎯 Preferences", callback_data="edit_prof_pref")
-        ],
-        [InlineKeyboardButton(text="🗑️ Deactivate Profile", callback_data="confirm_soft_delete")]
+            InlineKeyboardButton(text="🎯 Preferences", callback_data="edit_prof_pref"),
+            InlineKeyboardButton(text="🗑️ Deactivate Profile", callback_data="confirm_soft_delete")
+        ]
     ])
     await message.answer_photo(u["photo_id"], caption=caption, parse_mode="HTML", reply_markup=kb)
 
@@ -668,22 +730,6 @@ async def process_edit_bio(message: types.Message, state: FSMContext):
     await db_execute("UPDATE users SET bio = ? WHERE telegram_id = ?", bio_text, message.from_user.id)
     await state.clear()
     await message.answer("✅ Bio updated successfully!", reply_markup=main_menu_keyboard())
-
-@dp.callback_query(F.data == "edit_prof_city")
-async def cb_edit_city(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(EditProfileState.editing_city)
-    await callback.message.reply("📍 Enter your new city name:")
-    await callback.answer()
-
-@dp.message(EditProfileState.editing_city)
-async def process_edit_city(message: types.Message, state: FSMContext):
-    city = message.text.strip().title()
-    if not is_valid_city(city):
-        await message.answer("⚠️ Please enter a valid city name.")
-        return
-    await db_execute("UPDATE users SET city = ?, latitude = NULL, longitude = NULL WHERE telegram_id = ?", city, message.from_user.id)
-    await state.clear()
-    await message.answer(f"✅ Location updated to <b>{city}</b>!", parse_mode="HTML", reply_markup=main_menu_keyboard())
 
 @dp.callback_query(F.data == "edit_prof_pref")
 async def cb_edit_pref(callback: types.CallbackQuery):
@@ -755,9 +801,10 @@ async def cmd_matches(message: types.Message):
         u = u_rows[0]
         chat_url = f"https://t.me/{u['username']}" if u['username'] else f"tg://user?id={uid}"
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Open Private Chat", url=chat_url)]])
+        loc_str = f"{u.get('state', '')}, {u.get('country', '')}".strip(", ")
         await message.answer_photo(
             u['photo_id'],
-            caption=f"✨ <b>{u['full_name']}</b>, {u['age']} ({u['city']})\n📝 <i>{u['bio']}</i>",
+            caption=f"✨ <b>{u['full_name']}</b>, {u['age']} ({loc_str})\n📝 <i>{u['bio']}</i>",
             parse_mode="HTML",
             reply_markup=kb
         )
@@ -829,7 +876,7 @@ async def cmd_discover(message: types.Message):
     cand_id = candidate["telegram_id"]
 
     dist_km = calculate_distance(me['latitude'], me['longitude'], candidate['latitude'], candidate['longitude'])
-    dist_str = f"📍 <b>{dist_km} km away</b>" if dist_km is not None else f"📍 <b>{candidate['city']}</b>"
+    dist_str = f"📍 <b>{dist_km} km away</b>" if dist_km is not None else f"📍 <b>{candidate.get('state', '')}, {candidate.get('country', '')}</b>"
 
     badge = "🛡️ Verified" if candidate["is_verified"] else ""
     caption = (
@@ -909,7 +956,7 @@ async def cmd_chat_roulette_menu(message: types.Message):
     roulette_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🌐 Global Anyone (Fastest)", callback_data="join_queue_anyone"),
-            InlineKeyboardButton(text="🏙️ Same City Only", callback_data="join_queue_city")
+            InlineKeyboardButton(text="📍 Same State/Region", callback_data="join_queue_state")
         ],
         [
             InlineKeyboardButton(text="👩 Chat with Female", callback_data="join_queue_Female"),
@@ -936,12 +983,11 @@ async def cb_join_queue(callback: types.CallbackQuery):
 
     me = u_rows[0]
     my_gender = me['gender']
-    my_city = me['city']
+    my_state = me.get('state', '')
+    my_country = me.get('country', '')
 
-    # Remove any existing queue entry
     await db_execute("DELETE FROM roulette_queue WHERE user_id = ?", user_id)
 
-    # Search for an existing, mutually compatible partner in the database
     partner = None
     if mode == "anyone":
         candidates = await db_query("""
@@ -952,17 +998,17 @@ async def cb_join_queue(callback: types.CallbackQuery):
         """, user_id, my_gender)
         if candidates:
             partner = candidates[0]
-    elif mode == "city":
+    elif mode == "state":
         candidates = await db_query("""
             SELECT * FROM roulette_queue 
             WHERE user_id != ? 
-              AND LOWER(city) = LOWER(?)
-              AND (mode = 'city' OR mode = 'anyone')
+              AND LOWER(state) = LOWER(?)
+              AND (mode = 'state' OR mode = 'anyone')
             ORDER BY joined_at ASC LIMIT 1
-        """, user_id, my_city)
+        """, user_id, my_state)
         if candidates:
             partner = candidates[0]
-    else:  # Searching for 'Female' or 'Male'
+    else:  # Female or Male
         candidates = await db_query("""
             SELECT * FROM roulette_queue 
             WHERE user_id != ? 
@@ -984,7 +1030,7 @@ async def cb_join_queue(callback: types.CallbackQuery):
         msg = (
             "✨ <b>Connected with a partner!</b>\n\n"
             "• Messages, voice notes, photos & stickers are relayed anonymously.\n"
-            "• Tap <b>📍 Share Proximity</b> to show distance in km without giving away your address.\n"
+            "• Tap <b>📍 Share Proximity</b> to show distance in km without giving away your exact location.\n"
             "• Tap <b>⏹️ End Chat</b> or type /end when finished."
         )
         await bot.send_message(user_id, msg, parse_mode="HTML", reply_markup=anon_chat_keyboard())
@@ -992,11 +1038,10 @@ async def cb_join_queue(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # No immediate partner found: persist to DB queue
     await db_execute("""
-        INSERT INTO roulette_queue (user_id, gender, target_gender, city, mode) 
-        VALUES (?, ?, ?, ?, ?)
-    """, user_id, my_gender, me['target_gender'], my_city, mode)
+        INSERT INTO roulette_queue (user_id, gender, target_gender, country, state, mode) 
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, user_id, my_gender, me['target_gender'], my_country, my_state, mode)
 
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Cancel Search", callback_data="leave_anon_queue")]
@@ -1054,15 +1099,14 @@ async def cmd_end_chat(message: types.Message):
 @dp.message(F.text.in_(["⏭️ Next Person", "/next"]))
 async def cmd_next_person(message: types.Message):
     await end_anonymous_session(message.from_user.id)
-    # Directly re-queue
     u_rows = await db_query("SELECT * FROM users WHERE telegram_id = ?", message.from_user.id)
     if u_rows:
         me = u_rows[0]
         await db_execute("DELETE FROM roulette_queue WHERE user_id = ?", message.from_user.id)
         await db_execute("""
-            INSERT INTO roulette_queue (user_id, gender, target_gender, city, mode) 
-            VALUES (?, ?, ?, ?, 'anyone')
-        """, message.from_user.id, me['gender'], me['target_gender'], me['city'])
+            INSERT INTO roulette_queue (user_id, gender, target_gender, country, state, mode) 
+            VALUES (?, ?, ?, ?, ?, 'anyone')
+        """, message.from_user.id, me['gender'], me['target_gender'], me.get('country', ''), me.get('state', ''))
     await message.answer("🔍 Looking for a new partner...", reply_markup=ReplyKeyboardRemove())
 
 @dp.message(F.text == "📍 Share Proximity")
@@ -1081,7 +1125,8 @@ async def cmd_share_proximity(message: types.Message):
     if dist_km is not None:
         prox_msg = f"📍 <b>Proximity Alert:</b> You and your partner are approximately <b>{dist_km} km</b> apart!"
     else:
-        prox_msg = f"📍 <b>Proximity Alert:</b> Partner is registered in <b>{them['city']}</b> (GPS not provided)."
+        them_loc = f"{them.get('state', '')}, {them.get('country', '')}".strip(", ")
+        prox_msg = f"📍 <b>Proximity Alert:</b> Partner is registered in <b>{them_loc}</b>."
 
     await message.answer(prox_msg, parse_mode="HTML")
     try:
@@ -1122,7 +1167,6 @@ async def cb_rate_user(callback: types.CallbackQuery):
 # Strictly Isolated Anonymous Chat Relay Handler (Only active during live sessions)
 @dp.message(F.chat.type == "private")
 async def relay_anonymous_chat(message: types.Message, state: FSMContext):
-    # Guard: Do not intercept FSM flows or commands
     current_state = await state.get_state()
     if current_state is not None or (message.text and message.text.startswith("/")):
         return
@@ -1261,7 +1305,7 @@ async def cmd_admin_help(message: types.Message):
         "• <code>/user &lt;id&gt;</code> — Detailed dossier (photos, swipe counts, matches, ban toggles).\n\n"
         "📢 <b>Broadcasts:</b>\n"
         "• <code>/broadcast &lt;msg&gt;</code> — Send announcement to all active users.\n"
-        "• <code>/broadcast_city &lt;City&gt; &lt;msg&gt;</code> — Target single city.\n"
+        "• <code>/broadcast_country &lt;Country&gt; &lt;msg&gt;</code> — Target single country.\n"
         "• <code>/broadcast_gender &lt;Male|Female&gt; &lt;msg&gt;</code> — Target specific gender.\n\n"
         "💬 <b>Official Messaging:</b>\n"
         "• <code>/notice &lt;id&gt; &lt;msg&gt;</code> — Send official notice banner.\n"
@@ -1407,11 +1451,12 @@ async def inspect_user_profile(user_id: int, message_or_obj):
     reports_cnt = (await db_query("SELECT COUNT(*) as c FROM reports WHERE reported_id = ?", user_id))[0]['c']
 
     user_link = safe_user_mention(u['telegram_id'], u['full_name'], u['username'])
+    loc_str = f"{u.get('state', '')}, {u.get('country', '')}".strip(", ") or "GPS Stored"
     details = (
         f"🔍 <b>User Dossier:</b> {user_link}\n\n"
         f"• <b>Telegram ID:</b> <code>{u['telegram_id']}</code>\n"
         f"• <b>Age / Gender:</b> {u['age']} | {u['gender']} (Seeking: {u['target_gender']})\n"
-        f"• <b>Location:</b> {u['city']}\n"
+        f"• <b>Location:</b> {loc_str}\n"
         f"• <b>Karma:</b> {u['karma_score']} pts | Chats: {u['total_chats']}\n"
         f"• <b>Verified:</b> {'Yes 🛡️' if u['is_verified'] else 'No ❌'}\n"
         f"• <b>Approved/Active:</b> {'Yes 🟢' if u['is_approved'] else 'Paused ⚪'}\n"
@@ -1495,17 +1540,17 @@ async def cmd_broadcast(message: types.Message):
     users = await db_query("SELECT telegram_id FROM users WHERE is_banned = 0")
     await run_broadcast(users, text, message)
 
-@dp.message(Command("broadcast_city"))
-async def cmd_broadcast_city(message: types.Message):
+@dp.message(Command("broadcast_country"))
+async def cmd_broadcast_country(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3:
-        await message.answer("Usage: <code>/broadcast_city &lt;City&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        await message.answer("Usage: <code>/broadcast_country &lt;Country&gt; &lt;message&gt;</code>", parse_mode="HTML")
         return
-    city, text = parts[1].strip().title(), parts[2].strip()
-    users = await db_query("SELECT telegram_id FROM users WHERE LOWER(city) = LOWER(?) AND is_banned = 0", city)
-    await run_broadcast(users, text, message, target_desc=f"City: {city}")
+    country, text = parts[1].strip().title(), parts[2].strip()
+    users = await db_query("SELECT telegram_id FROM users WHERE LOWER(country) = LOWER(?) AND is_banned = 0", country)
+    await run_broadcast(users, text, message, target_desc=f"Country: {country}")
 
 @dp.message(Command("broadcast_gender"))
 async def cmd_broadcast_gender(message: types.Message):
@@ -1644,7 +1689,7 @@ async def cmd_remind_incomplete(message: types.Message):
 # Embedded Web Server (Render Port Binding & Health Check)
 # ---------------------------------------------------------
 async def handle_health(request):
-    return web.Response(text="Soulmate Engine is healthy!", status=200)
+    return web.Response(text="Soulmate Engine is running healthy!", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -1676,7 +1721,7 @@ async def main():
     except Exception as e:
         logger.warning(f"Could not register admin command menu: {e}")
 
-    logger.info("Bot is fully operational with Global Discovery, Anonymous Roulette, and Full Admin Suite...")
+    logger.info("Bot is fully operational with Mandatory GPS, Nationality/State Onboarding, and Fixed Photo Handlers...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
