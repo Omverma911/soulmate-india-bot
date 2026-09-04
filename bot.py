@@ -106,8 +106,6 @@ async def init_db():
             logger.warning("Falling back to local SQLite storage...")
             is_postgres = False
     else:
-        if not asyncpg:
-            logger.warning("⚠️ asyncpg is not installed! Falling back to SQLite.")
         is_postgres = False
 
     schema = """
@@ -190,24 +188,16 @@ async def init_db():
     if is_postgres:
         async with db_pool.acquire() as conn:
             await conn.execute(schema)
-            # Automatic schema migration for country and state
-            await conn.execute("""
-                DO $$ 
-                BEGIN 
-                    BEGIN
-                        ALTER TABLE users ADD COLUMN country TEXT;
-                    EXCEPTION WHEN duplicate_column THEN END;
-                    BEGIN
-                        ALTER TABLE users ADD COLUMN state TEXT;
-                    EXCEPTION WHEN duplicate_column THEN END;
-                    BEGIN
-                        ALTER TABLE roulette_queue ADD COLUMN country TEXT;
-                    EXCEPTION WHEN duplicate_column THEN END;
-                    BEGIN
-                        ALTER TABLE roulette_queue ADD COLUMN state TEXT;
-                    EXCEPTION WHEN duplicate_column THEN END;
-                END $$;
-            """)
+            # Safe column check without syntax errors
+            for col in ["country", "state"]:
+                try:
+                    await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} TEXT;")
+                except Exception:
+                    pass
+                try:
+                    await conn.execute(f"ALTER TABLE roulette_queue ADD COLUMN IF NOT EXISTS {col} TEXT;")
+                except Exception:
+                    pass
     else:
         sqlite_schema = (schema
                          .replace("BIGINT", "INTEGER")
@@ -273,10 +263,9 @@ class AdminReplyState(StatesGroup):
 class EditProfileState(StatesGroup):
     editing_photo = State()
     editing_bio = State()
-    editing_location = State()
 
 # ---------------------------------------------------------
-# Sanitization & Helper Functions
+# Helpers & Validation
 # ---------------------------------------------------------
 def is_valid_name(name: str) -> bool:
     name = name.strip()
@@ -311,7 +300,7 @@ def anon_chat_keyboard():
     )
 
 # ---------------------------------------------------------
-# Lifecycle Management (Zero Data Loss)
+# Lifecycle Management
 # ---------------------------------------------------------
 @dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=KICKED))
 async def handle_user_blocked(event: types.ChatMemberUpdated):
@@ -328,7 +317,366 @@ async def handle_user_unblocked(event: types.ChatMemberUpdated):
     await db_execute("UPDATE users SET is_approved = 1 WHERE telegram_id = ? AND is_verified = 1 AND is_banned = 0", user_id)
 
 # ---------------------------------------------------------
-# Mandatory GPS + Country/State Onboarding Flow
+# Admin Control Suite (Placed First to Guarantee Precedence)
+# ---------------------------------------------------------
+@dp.message(Command("admin", "admin_help"))
+async def cmd_admin_help(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    admin_text = (
+        "🛠️ <b>Soulmate Global & India Admin Control Center</b>\n\n"
+        "📊 <b>Diagnostics & Monitoring:</b>\n"
+        "• <code>/admin_stats</code> — DB engine, active users, matches, swipes, reports, drop-offs.\n"
+        "• <code>/user &lt;id&gt;</code> — Detailed dossier (photos, swipe counts, matches, ban toggles).\n\n"
+        "📢 <b>Broadcasts:</b>\n"
+        "• <code>/broadcast &lt;msg&gt;</code> — Send announcement to all active users.\n"
+        "• <code>/broadcast_country &lt;Country&gt; &lt;msg&gt;</code> — Target single country.\n"
+        "• <code>/broadcast_gender &lt;Male|Female&gt; &lt;msg&gt;</code> — Target specific gender.\n\n"
+        "💬 <b>Official Messaging:</b>\n"
+        "• <code>/notice &lt;id&gt; &lt;msg&gt;</code> — Send official notice banner.\n"
+        "• <code>/reply &lt;id&gt; &lt;msg&gt;</code> — Send anonymous support reply.\n\n"
+        "🛡️ <b>Moderation & Access:</b>\n"
+        "• <code>/ban &lt;id&gt;</code> — Soft-hide and suspend a user from discovery.\n"
+        "• <code>/unban &lt;id&gt;</code> — Restore an account to active discovery.\n\n"
+        "⏰ <b>Retention Nudges:</b>\n"
+        "• <code>/remind_unverified</code> — Ping users awaiting selfie verification.\n"
+        "• <code>/remind_incomplete</code> — Ping dropped-off registrations to finish signup."
+    )
+
+    quick_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 View Stats", callback_data="admin_quick_stats"),
+            InlineKeyboardButton(text="⏰ Nudge Incomplete", callback_data="admin_quick_nudge_inc")
+        ],
+        [
+            InlineKeyboardButton(text="⏳ Nudge Unverified", callback_data="admin_quick_nudge_unver")
+        ]
+    ])
+    await message.answer(admin_text, parse_mode="HTML", reply_markup=quick_kb)
+
+@dp.callback_query(F.data == "admin_quick_stats")
+async def cb_quick_stats(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await cmd_admin_stats(callback.message)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_quick_nudge_inc")
+async def cb_quick_nudge_inc(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await cmd_remind_incomplete(callback.message)
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_quick_nudge_unver")
+async def cb_quick_nudge_unver(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await cmd_remind_unverified(callback.message)
+    await callback.answer()
+
+@dp.message(Command("admin_stats"))
+async def cmd_admin_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    users_cnt = (await db_query("SELECT COUNT(*) as c FROM users"))[0]['c']
+    verified_cnt = (await db_query("SELECT COUNT(*) as c FROM users WHERE is_verified = 1"))[0]['c']
+    approved_cnt = (await db_query("SELECT COUNT(*) as c FROM users WHERE is_approved = 1"))[0]['c']
+    pending_verif = (await db_query("SELECT COUNT(*) as c FROM users WHERE is_verified = 0 AND is_banned = 0"))[0]['c']
+    dropoffs = (await db_query("""
+        SELECT COUNT(*) as c FROM pending_registrations p 
+        LEFT JOIN users u ON p.telegram_id = u.telegram_id 
+        WHERE u.telegram_id IS NULL
+    """))[0]['c']
+    matches_cnt = (await db_query("SELECT COUNT(*) as c FROM matches"))[0]['c']
+    swipes_cnt = (await db_query("SELECT COUNT(*) as c FROM swipes"))[0]['c']
+    active_roulette = (await db_query("SELECT COUNT(*) as c FROM active_chats"))[0]['c']
+    waiting_roulette = (await db_query("SELECT COUNT(*) as c FROM roulette_queue"))[0]['c']
+    feedback_cnt = (await db_query("SELECT COUNT(*) as c FROM feedback"))[0]['c']
+    reports_cnt = (await db_query("SELECT COUNT(*) as c FROM reports"))[0]['c']
+
+    engine_label = "Neon PostgreSQL (Cloud ☁️)" if is_postgres else "SQLite (Local File 📁)"
+
+    stats_msg = (
+        f"📊 <b>Soulmate Global Administration Dashboard</b>\n\n"
+        f"💾 <b>Database Engine:</b> {engine_label}\n"
+        f"👥 <b>Total Registered:</b> {users_cnt}\n"
+        f"🛡️ <b>Verified Profiles:</b> {verified_cnt}\n"
+        f"🟢 <b>Active in Discovery:</b> {approved_cnt}\n"
+        f"⏳ <b>Awaiting Verification:</b> {pending_verif}\n"
+        f"🚪 <b>Drop-offs:</b> {dropoffs}\n"
+        f"❤️ <b>Total Swipes:</b> {swipes_cnt}\n"
+        f"💍 <b>Total Matches:</b> {matches_cnt}\n"
+        f"🎭 <b>Roulette Rooms Active:</b> {active_roulette // 2}\n"
+        f"⏳ <b>Roulette Queue:</b> {waiting_roulette} waiting\n"
+        f"💬 <b>Feedback Submissions:</b> {feedback_cnt}\n"
+        f"🚨 <b>Total Reports Logged:</b> {reports_cnt}"
+    )
+    await message.answer(stats_msg, parse_mode="HTML")
+
+@dp.message(Command("user"))
+async def cmd_inspect_user(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/user &lt;telegram_id&gt;</code>", parse_mode="HTML")
+        return
+    user_id = int(parts[1])
+    await inspect_user_profile(user_id, message)
+
+@dp.callback_query(F.data.startswith("inspect_user_"))
+async def cb_inspect_user(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    user_id = int(callback.data.split("_")[2])
+    await inspect_user_profile(user_id, callback.message)
+    await callback.answer()
+
+async def inspect_user_profile(user_id: int, message_or_obj):
+    rows = await db_query("SELECT * FROM users WHERE telegram_id = ?", user_id)
+    if not rows:
+        await message_or_obj.reply(f"❌ User <code>{user_id}</code> not found in database.", parse_mode="HTML")
+        return
+    u = rows[0]
+
+    likes_given = (await db_query("SELECT COUNT(*) as c FROM swipes WHERE swiper_id = ? AND action = 'like'", user_id))[0]['c']
+    likes_received = (await db_query("SELECT COUNT(*) as c FROM swipes WHERE swiped_id = ? AND action = 'like'", user_id))[0]['c']
+    matches_cnt = (await db_query("SELECT COUNT(*) as c FROM matches WHERE user1_id = ? OR user2_id = ?", user_id, user_id))[0]['c']
+    reports_cnt = (await db_query("SELECT COUNT(*) as c FROM reports WHERE reported_id = ?", user_id))[0]['c']
+
+    user_link = safe_user_mention(u['telegram_id'], u['full_name'], u['username'])
+    loc_str = f"{u.get('state', '')}, {u.get('country', '')}".strip(", ") or "GPS Stored"
+    details = (
+        f"🔍 <b>User Dossier:</b> {user_link}\n\n"
+        f"• <b>Telegram ID:</b> <code>{u['telegram_id']}</code>\n"
+        f"• <b>Age / Gender:</b> {u['age']} | {u['gender']} (Seeking: {u['target_gender']})\n"
+        f"• <b>Location:</b> {loc_str}\n"
+        f"• <b>Karma:</b> {u['karma_score']} pts | Chats: {u['total_chats']}\n"
+        f"• <b>Verified:</b> {'Yes 🛡️' if u['is_verified'] else 'No ❌'}\n"
+        f"• <b>Approved/Active:</b> {'Yes 🟢' if u['is_approved'] else 'Paused ⚪'}\n"
+        f"• <b>Status:</b> {'🚫 BANNED' if u['is_banned'] else 'Normal'}\n"
+        f"• <b>Activity:</b> Given: {likes_given} ❤️ | Received: {likes_received} 💌\n"
+        f"• <b>Matches:</b> {matches_cnt} | <b>Reports:</b> {reports_cnt} 🚨\n\n"
+        f"📝 <b>Bio:</b> {u['bio']}"
+    )
+
+    action_buttons = []
+    if u['is_banned']:
+        action_buttons.append(InlineKeyboardButton(text="🟢 Unban", callback_data=f"admin_unban_{user_id}"))
+    else:
+        action_buttons.append(InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{user_id}"))
+    action_buttons.append(InlineKeyboardButton(text="💬 Message", callback_data=f"admin_prep_reply_{user_id}"))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[action_buttons])
+    await message_or_obj.reply_photo(u['photo_id'], caption=details, parse_mode="HTML", reply_markup=kb)
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/ban &lt;telegram_id&gt;</code>", parse_mode="HTML")
+        return
+    user_id = int(parts[1])
+    await db_execute("UPDATE users SET is_banned = 1, is_approved = 0 WHERE telegram_id = ?", user_id)
+    await message.answer(f"🚫 User <code>{user_id}</code> is now banned and soft-hidden.", parse_mode="HTML")
+    try:
+        await bot.send_message(user_id, "🚫 Your account has been suspended for violating our terms.")
+    except Exception:
+        pass
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Usage: <code>/unban &lt;telegram_id&gt;</code>", parse_mode="HTML")
+        return
+    user_id = int(parts[1])
+    await db_execute("UPDATE users SET is_banned = 0, is_approved = 1 WHERE telegram_id = ? AND is_verified = 1", user_id)
+    await message.answer(f"🟢 User <code>{user_id}</code> unbanned and restored to discovery.", parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("admin_unban_"))
+async def cb_admin_unban(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    user_id = int(callback.data.split("_")[2])
+    await db_execute("UPDATE users SET is_banned = 0, is_approved = 1 WHERE telegram_id = ? AND is_verified = 1", user_id)
+    await callback.message.reply(f"🟢 User <code>{user_id}</code> unbanned.", parse_mode="HTML")
+    await callback.answer("Unbanned.")
+
+@dp.callback_query(F.data.startswith("admin_ban_"))
+async def cb_admin_ban(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    user_id = int(callback.data.split("_")[2])
+    await db_execute("UPDATE users SET is_banned = 1, is_approved = 0 WHERE telegram_id = ?", user_id)
+    await callback.message.reply(f"🚫 User <code>{user_id}</code> banned and soft-hidden.", parse_mode="HTML")
+    try:
+        await bot.send_message(user_id, "🚫 Your account has been suspended.")
+    except Exception:
+        pass
+    await callback.answer("Banned.")
+
+@dp.message(Command("reply"))
+async def cmd_reply(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Usage: <code>/reply &lt;user_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    target_id = int(parts[1])
+    text = parts[2]
+    try:
+        await bot.send_message(
+            target_id,
+            f"💌 <b>Message from Soulmate Support:</b>\n\n{text}",
+            parse_mode="HTML"
+        )
+        await message.answer(f"✅ Reply delivered to <code>{target_id}</code>!", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Failed: {e}")
+
+@dp.message(Command("notice"))
+async def cmd_notice(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Usage: <code>/notice &lt;telegram_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    target_id = int(parts[1])
+    notice_text = parts[2]
+    try:
+        await bot.send_message(target_id, f"📢 <b>Official Notice from Administration</b>\n\n{notice_text}", parse_mode="HTML")
+        await message.answer(f"✅ Notice delivered to <code>{target_id}</code>!", parse_mode="HTML")
+    except TelegramForbiddenError:
+        await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", target_id)
+        await message.answer(f"❌ User <code>{target_id}</code> blocked the bot or account deactivated.", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Failed to deliver: {e}")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = message.text.replace("/broadcast", "", 1).strip()
+    if not text:
+        await message.answer("Usage: <code>/broadcast &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    users = await db_query("SELECT telegram_id FROM users WHERE is_banned = 0")
+    await run_broadcast(users, text, message)
+
+@dp.message(Command("broadcast_country"))
+async def cmd_broadcast_country(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Usage: <code>/broadcast_country &lt;Country&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    country, text = parts[1].strip().title(), parts[2].strip()
+    users = await db_query("SELECT telegram_id FROM users WHERE LOWER(country) = LOWER(?) AND is_banned = 0", country)
+    await run_broadcast(users, text, message, target_desc=f"Country: {country}")
+
+@dp.message(Command("broadcast_gender"))
+async def cmd_broadcast_gender(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer("Usage: <code>/broadcast_gender &lt;Male|Female&gt; &lt;message&gt;</code>", parse_mode="HTML")
+        return
+    gender, text = parts[1].strip().title(), parts[2].strip()
+    users = await db_query("SELECT telegram_id FROM users WHERE gender = ? AND is_banned = 0", gender)
+    await run_broadcast(users, text, message, target_desc=f"Gender: {gender}")
+
+async def run_broadcast(users, text, admin_msg, target_desc="All Users"):
+    sent, blocked = 0, 0
+    for u in users:
+        uid = u["telegram_id"]
+        try:
+            await bot.send_message(uid, text, parse_mode="HTML")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            blocked += 1
+            await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", uid)
+        except Exception:
+            blocked += 1
+
+    await admin_msg.answer(
+        f"✅ <b>Broadcast Completed! ({target_desc})</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked/Failed: {blocked}",
+        parse_mode="HTML"
+    )
+
+@dp.message(Command("remind_unverified"))
+async def cmd_remind_unverified(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    rows = await db_query("SELECT telegram_id FROM users WHERE is_verified = 0 AND is_banned = 0")
+    if not rows:
+        await message.answer("✅ No users currently pending verification.")
+        return
+    sent, blocked = 0, 0
+    for r in rows:
+        uid = r["telegram_id"]
+        try:
+            await bot.send_message(
+                uid,
+                "⏳ <b>Your Soulmate Profile is Under Review</b>\n\n"
+                "Our team is currently verifying your gesture selfie. You'll be ready to discover matches very soon!",
+                parse_mode="HTML"
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            blocked += 1
+            await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", uid)
+        except Exception:
+            blocked += 1
+    await message.answer(f"✅ <b>Reminders Complete!</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked: {blocked}", parse_mode="HTML")
+
+@dp.message(Command("remind_incomplete"))
+async def cmd_remind_incomplete(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    dropoffs = await db_query("""
+        SELECT p.telegram_id FROM pending_registrations p
+        LEFT JOIN users u ON p.telegram_id = u.telegram_id 
+        WHERE u.telegram_id IS NULL
+    """)
+    if not dropoffs:
+        await message.answer("✅ No incomplete signups found.")
+        return
+    sent, blocked = 0, 0
+    for d in dropoffs:
+        uid = d["telegram_id"]
+        try:
+            await bot.send_message(
+                uid,
+                "✨ <b>You're almost there!</b>\n\n"
+                "You started setting up your profile on <b>Soulmate Global</b> but didn't finish.\n"
+                "Tap /start to complete your profile in 60 seconds and find genuine matches!",
+                parse_mode="HTML"
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            blocked += 1
+            await db_execute("DELETE FROM pending_registrations WHERE telegram_id = ?", uid)
+        except Exception:
+            blocked += 1
+    await message.answer(f"✅ <b>Drop-off Reminders Complete!</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked: {blocked}", parse_mode="HTML")
+
+# ---------------------------------------------------------
+# User Registration FSM Handlers
 # ---------------------------------------------------------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -408,17 +756,16 @@ async def process_target_gender(message: types.Message, state: FSMContext):
     await state.update_data(target_gender=message.text)
     await state.set_state(Registration.mandatory_gps)
 
-    # MANDATORY GPS LOCATION ONLY - NO MANUAL CITY OPTION
     gps_kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🛰️ Share Live Location (Mandatory for Proximity)", request_location=True)]
+            [KeyboardButton(text="🛰️ Share Live Location (Mandatory)", request_location=True)]
         ],
         resize_keyboard=True,
         one_time_keyboard=True
     )
     await message.answer(
         "📍 <b>GPS Verification (Mandatory):</b>\n\n"
-        "To ensure zero fake location spoofing and show accurate distance in kilometers, "
+        "To prevent fake location spoofing and show accurate distance in kilometers, "
         "please tap the button below to share your live GPS location.",
         parse_mode="HTML",
         reply_markup=gps_kb
@@ -432,7 +779,7 @@ async def process_mandatory_gps(message: types.Message, state: FSMContext):
     await state.set_state(Registration.country)
     await message.answer(
         "🛰️ <b>GPS Coordinates Verified!</b>\n\n"
-        "What is your <b>Nationality / Country</b>? (e.g. India, United States, United Kingdom, UAE):",
+        "What is your <b>Nationality / Country</b>? (e.g. India, United States, UAE, United Kingdom):",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove()
     )
@@ -441,12 +788,12 @@ async def process_mandatory_gps(message: types.Message, state: FSMContext):
 async def process_mandatory_gps_invalid(message: types.Message):
     gps_kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🛰️ Share Live Location (Mandatory for Proximity)", request_location=True)]
+            [KeyboardButton(text="🛰️ Share Live Location (Mandatory)", request_location=True)]
         ],
         resize_keyboard=True,
         one_time_keyboard=True
     )
-    await message.answer("⚠️ You must tap <b>🛰️ Share Live Location</b> to proceed.", parse_mode="HTML", reply_markup=gps_kb)
+    await message.answer("⚠️ You must tap <b>🛰️ Share Live Location</b> to continue.", parse_mode="HTML", reply_markup=gps_kb)
 
 @dp.message(Registration.country)
 async def process_country(message: types.Message, state: FSMContext):
@@ -456,7 +803,7 @@ async def process_country(message: types.Message, state: FSMContext):
         return
     await state.update_data(country=country)
     await state.set_state(Registration.state_province)
-    await message.answer(f"Got it, {country}! Now enter your <b>State / Province</b> (e.g. Jharkhand, Maharashtra, California, Ontario):", parse_mode="HTML")
+    await message.answer(f"Got it, {country}! Now enter your <b>State / Province</b> (e.g. Jharkhand, Maharashtra, California):", parse_mode="HTML")
 
 @dp.message(Registration.state_province)
 async def process_state(message: types.Message, state: FSMContext):
@@ -466,7 +813,7 @@ async def process_state(message: types.Message, state: FSMContext):
         return
     await state.update_data(state=state_prov)
     await state.set_state(Registration.bio)
-    await message.answer("Write a short bio about yourself (your passions, lifestyle, hobbies):")
+    await message.answer("Write a short bio about yourself (passions, lifestyle, hobbies):")
 
 @dp.message(Registration.bio)
 async def process_bio(message: types.Message, state: FSMContext):
@@ -486,7 +833,7 @@ async def process_photo(message: types.Message, state: FSMContext):
     await message.answer(
         "✌️ <b>Anti-Fake Verification Step</b>\n\n"
         "To earn the <b>Blue Shield Badge 🛡️</b> and prevent catfishing, upload a selfie holding up a <b>Peace Sign (✌️)</b>.\n\n"
-        "<i>Send as photo or file. This photo is strictly confidential and is never shown publicly on your profile.</i>",
+        "<i>Send as photo or uncompressed image. This photo is strictly confidential and is never shown publicly on your profile.</i>",
         parse_mode="HTML"
     )
 
@@ -494,7 +841,6 @@ async def process_photo(message: types.Message, state: FSMContext):
 async def process_photo_invalid(message: types.Message):
     await message.answer("⚠️ Please upload an image photo for your profile.")
 
-# FIXED: Handles both standard photo uploads and uncompressed image document attachments
 @dp.message(Registration.gesture_selfie, F.photo | F.document)
 async def process_gesture_selfie(message: types.Message, state: FSMContext):
     gesture_photo_id = None
@@ -541,12 +887,11 @@ async def process_gesture_selfie(message: types.Message, state: FSMContext):
 
     await message.answer(
         "🎉 <b>Profile & Gesture Selfie Received!</b>\n\n"
-        "Our moderators are reviewing your peace sign gesture selfie. You'll receive a confirmation notice as soon as your profile is verified!",
+        "Our moderators are reviewing your peace sign gesture selfie. You'll receive a notification here once approved!",
         parse_mode="HTML",
         reply_markup=main_menu_keyboard()
     )
 
-    # Alert Admin
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Approve", callback_data=f"verify_ok_{user_id}"),
@@ -576,7 +921,7 @@ async def process_gesture_selfie(message: types.Message, state: FSMContext):
 
 @dp.message(Registration.gesture_selfie)
 async def fallback_gesture_selfie(message: types.Message):
-    await message.answer("⚠️ Please send a <b>photo</b> showing your face holding up a Peace Sign (✌️) to finish verification.", parse_mode="HTML")
+    await message.answer("⚠️ Please upload a <b>photo</b> of you holding up a Peace Sign (✌️).", parse_mode="HTML")
 
 # ---------------------------------------------------------
 # Verification Callbacks & Selfie Retake Flow
@@ -943,7 +1288,7 @@ async def handle_swipe(callback: types.CallbackQuery):
     await callback.answer()
 
 # ---------------------------------------------------------
-# Anonymous Chat Roulette Engine (Persistent & Symmetrical)
+# Anonymous Chat Roulette Engine
 # ---------------------------------------------------------
 @dp.message(F.text.in_(["⚡ Random Chat Roulette", "/roulette"]))
 async def cmd_chat_roulette_menu(message: types.Message):
@@ -1164,35 +1509,8 @@ async def cb_rate_user(callback: types.CallbackQuery):
     await callback.message.edit_text("⭐ Rating submitted. Thank you for keeping the community safe!")
     await callback.answer()
 
-# Strictly Isolated Anonymous Chat Relay Handler (Only active during live sessions)
-@dp.message(F.chat.type == "private")
-async def relay_anonymous_chat(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is not None or (message.text and message.text.startswith("/")):
-        return
-
-    user_id = message.from_user.id
-    active = await db_query("SELECT partner_id FROM active_chats WHERE user_id = ?", user_id)
-    if not active:
-        return
-
-    partner_id = active[0]['partner_id']
-    try:
-        if message.text:
-            await bot.send_message(partner_id, message.text)
-        elif message.photo:
-            await bot.send_photo(partner_id, message.photo[-1].file_id, caption=message.caption or "")
-        elif message.voice:
-            await bot.send_voice(partner_id, message.voice.file_id)
-        elif message.video_note:
-            await bot.send_video_note(partner_id, message.video_note.file_id)
-        elif message.sticker:
-            await bot.send_sticker(partner_id, message.sticker.file_id)
-    except TelegramForbiddenError:
-        await end_anonymous_session(user_id)
-
 # ---------------------------------------------------------
-# Feedback & Report Engines
+# Feedback & Reporting
 # ---------------------------------------------------------
 @dp.message(F.text.in_(["/feedback", "💬 Feedback"]))
 async def cmd_feedback(message: types.Message, state: FSMContext):
@@ -1291,405 +1609,41 @@ async def cb_dismiss_report(callback: types.CallbackQuery):
     await callback.answer("Report dismissed.")
 
 # ---------------------------------------------------------
-# Complete Admin Control Suite & Inspection Dossier
+# Anonymous Chat Relay Handler (STRICTLY CONSTRAINED)
 # ---------------------------------------------------------
-@dp.message(Command("admin", "admin_help"))
-async def cmd_admin_help(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+# Placed at the very bottom: Only triggers if the message is NOT a command,
+# the user is NOT in an FSM state, and they have an active row in active_chats!
+@dp.message(F.chat.type == "private", ~F.text.startswith("/"))
+async def relay_anonymous_chat(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is not None:
         return
 
-    admin_text = (
-        "🛠️ <b>Soulmate Global & India Admin Control Center</b>\n\n"
-        "📊 <b>Diagnostics & Monitoring:</b>\n"
-        "• <code>/admin_stats</code> — DB engine, active users, matches, swipes, reports, drop-offs.\n"
-        "• <code>/user &lt;id&gt;</code> — Detailed dossier (photos, swipe counts, matches, ban toggles).\n\n"
-        "📢 <b>Broadcasts:</b>\n"
-        "• <code>/broadcast &lt;msg&gt;</code> — Send announcement to all active users.\n"
-        "• <code>/broadcast_country &lt;Country&gt; &lt;msg&gt;</code> — Target single country.\n"
-        "• <code>/broadcast_gender &lt;Male|Female&gt; &lt;msg&gt;</code> — Target specific gender.\n\n"
-        "💬 <b>Official Messaging:</b>\n"
-        "• <code>/notice &lt;id&gt; &lt;msg&gt;</code> — Send official notice banner.\n"
-        "• <code>/reply &lt;id&gt; &lt;msg&gt;</code> — Send anonymous support reply.\n\n"
-        "🛡️ <b>Moderation & Access:</b>\n"
-        "• <code>/ban &lt;id&gt;</code> — Soft-hide and suspend a user from discovery.\n"
-        "• <code>/unban &lt;id&gt;</code> — Restore an account to active discovery.\n\n"
-        "⏰ <b>Retention Nudges:</b>\n"
-        "• <code>/remind_unverified</code> — Ping users awaiting selfie verification.\n"
-        "• <code>/remind_incomplete</code> — Ping dropped-off registrations to finish signup."
-    )
-
-    quick_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📊 View Stats", callback_data="admin_quick_stats"),
-            InlineKeyboardButton(text="⏰ Nudge Incomplete", callback_data="admin_quick_nudge_inc")
-        ],
-        [
-            InlineKeyboardButton(text="⏳ Nudge Unverified", callback_data="admin_quick_nudge_unver")
-        ]
-    ])
-    await message.answer(admin_text, parse_mode="HTML", reply_markup=quick_kb)
-
-@dp.callback_query(F.data == "admin_quick_stats")
-async def cb_quick_stats(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    user_id = message.from_user.id
+    active = await db_query("SELECT partner_id FROM active_chats WHERE user_id = ?", user_id)
+    if not active:
         return
-    await cmd_admin_stats(callback.message)
-    await callback.answer()
 
-@dp.callback_query(F.data == "admin_quick_nudge_inc")
-async def cb_quick_nudge_inc(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    await cmd_remind_incomplete(callback.message)
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_quick_nudge_unver")
-async def cb_quick_nudge_unver(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    await cmd_remind_unverified(callback.message)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("admin_prep_reply_"))
-async def cb_admin_prep_reply(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    user_id = int(callback.data.split("_")[3])
-    await state.update_data(reply_target_id=user_id)
-    await state.set_state(AdminReplyState.waiting_for_reply)
-    await callback.message.reply(f"✍️ Type your official reply message for user <code>{user_id}</code>:")
-    await callback.answer()
-
-@dp.message(AdminReplyState.waiting_for_reply)
-async def process_admin_reply(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-    data = await state.get_data()
-    target_id = data.get("reply_target_id")
-    reply_text = message.text
-    
+    partner_id = active[0]['partner_id']
     try:
-        await bot.send_message(
-            target_id,
-            f"💌 <b>Message from Soulmate India Support:</b>\n\n{reply_text}",
-            parse_mode="HTML"
-        )
-        await message.answer(f"✅ Official reply delivered to <code>{target_id}</code>!", parse_mode="HTML")
-    except Exception as e:
-        await message.answer(f"❌ Failed to deliver: {e}")
-    finally:
-        await state.clear()
-
-@dp.message(Command("reply"))
-async def cmd_reply(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("Usage: <code>/reply &lt;user_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
-        return
-    target_id = int(parts[1])
-    text = parts[2]
-    try:
-        await bot.send_message(
-            target_id,
-            f"💌 <b>Message from Soulmate India Support:</b>\n\n{text}",
-            parse_mode="HTML"
-        )
-        await message.answer(f"✅ Reply delivered to <code>{target_id}</code>!", parse_mode="HTML")
-    except Exception as e:
-        await message.answer(f"❌ Failed: {e}")
-
-@dp.message(Command("notice"))
-async def cmd_notice(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("Usage: <code>/notice &lt;telegram_id&gt; &lt;message&gt;</code>", parse_mode="HTML")
-        return
-    target_id = int(parts[1])
-    notice_text = parts[2]
-    try:
-        await bot.send_message(target_id, f"📢 <b>Official Notice from Administration</b>\n\n{notice_text}", parse_mode="HTML")
-        await message.answer(f"✅ Notice delivered to <code>{target_id}</code>!", parse_mode="HTML")
+        if message.text:
+            await bot.send_message(partner_id, message.text)
+        elif message.photo:
+            await bot.send_photo(partner_id, message.photo[-1].file_id, caption=message.caption or "")
+        elif message.voice:
+            await bot.send_voice(partner_id, message.voice.file_id)
+        elif message.video_note:
+            await bot.send_video_note(partner_id, message.video_note.file_id)
+        elif message.sticker:
+            await bot.send_sticker(partner_id, message.sticker.file_id)
     except TelegramForbiddenError:
-        await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", target_id)
-        await message.answer(f"❌ User <code>{target_id}</code> blocked the bot or account deactivated.", parse_mode="HTML")
-    except Exception as e:
-        await message.answer(f"❌ Failed to deliver: {e}")
-
-@dp.message(Command("user"))
-async def cmd_inspect_user(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Usage: <code>/user &lt;telegram_id&gt;</code>", parse_mode="HTML")
-        return
-    user_id = int(parts[1])
-    await inspect_user_profile(user_id, message)
-
-@dp.callback_query(F.data.startswith("inspect_user_"))
-async def cb_inspect_user(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    user_id = int(callback.data.split("_")[2])
-    await inspect_user_profile(user_id, callback.message)
-    await callback.answer()
-
-async def inspect_user_profile(user_id: int, message_or_obj):
-    rows = await db_query("SELECT * FROM users WHERE telegram_id = ?", user_id)
-    if not rows:
-        await message_or_obj.reply(f"❌ User <code>{user_id}</code> not found in database.", parse_mode="HTML")
-        return
-    u = rows[0]
-
-    likes_given = (await db_query("SELECT COUNT(*) as c FROM swipes WHERE swiper_id = ? AND action = 'like'", user_id))[0]['c']
-    likes_received = (await db_query("SELECT COUNT(*) as c FROM swipes WHERE swiped_id = ? AND action = 'like'", user_id))[0]['c']
-    matches_cnt = (await db_query("SELECT COUNT(*) as c FROM matches WHERE user1_id = ? OR user2_id = ?", user_id, user_id))[0]['c']
-    reports_cnt = (await db_query("SELECT COUNT(*) as c FROM reports WHERE reported_id = ?", user_id))[0]['c']
-
-    user_link = safe_user_mention(u['telegram_id'], u['full_name'], u['username'])
-    loc_str = f"{u.get('state', '')}, {u.get('country', '')}".strip(", ") or "GPS Stored"
-    details = (
-        f"🔍 <b>User Dossier:</b> {user_link}\n\n"
-        f"• <b>Telegram ID:</b> <code>{u['telegram_id']}</code>\n"
-        f"• <b>Age / Gender:</b> {u['age']} | {u['gender']} (Seeking: {u['target_gender']})\n"
-        f"• <b>Location:</b> {loc_str}\n"
-        f"• <b>Karma:</b> {u['karma_score']} pts | Chats: {u['total_chats']}\n"
-        f"• <b>Verified:</b> {'Yes 🛡️' if u['is_verified'] else 'No ❌'}\n"
-        f"• <b>Approved/Active:</b> {'Yes 🟢' if u['is_approved'] else 'Paused ⚪'}\n"
-        f"• <b>Status:</b> {'🚫 BANNED' if u['is_banned'] else 'Normal'}\n"
-        f"• <b>Activity:</b> Given: {likes_given} ❤️ | Received: {likes_received} 💌\n"
-        f"• <b>Matches:</b> {matches_cnt} | <b>Reports:</b> {reports_cnt} 🚨\n\n"
-        f"📝 <b>Bio:</b> {u['bio']}"
-    )
-
-    action_buttons = []
-    if u['is_banned']:
-        action_buttons.append(InlineKeyboardButton(text="🟢 Unban", callback_data=f"admin_unban_{user_id}"))
-    else:
-        action_buttons.append(InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{user_id}"))
-    action_buttons.append(InlineKeyboardButton(text="💬 Message", callback_data=f"admin_prep_reply_{user_id}"))
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[action_buttons])
-    await message_or_obj.reply_photo(u['photo_id'], caption=details, parse_mode="HTML", reply_markup=kb)
-
-@dp.message(Command("ban"))
-async def cmd_ban(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Usage: <code>/ban &lt;telegram_id&gt;</code>", parse_mode="HTML")
-        return
-    user_id = int(parts[1])
-    await db_execute("UPDATE users SET is_banned = 1, is_approved = 0 WHERE telegram_id = ?", user_id)
-    await message.answer(f"🚫 User <code>{user_id}</code> is now banned and soft-hidden.", parse_mode="HTML")
-    try:
-        await bot.send_message(user_id, "🚫 Your account has been suspended for violating our terms.")
-    except Exception:
-        pass
-
-@dp.message(Command("unban"))
-async def cmd_unban(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Usage: <code>/unban &lt;telegram_id&gt;</code>", parse_mode="HTML")
-        return
-    user_id = int(parts[1])
-    await db_execute("UPDATE users SET is_banned = 0, is_approved = 1 WHERE telegram_id = ? AND is_verified = 1", user_id)
-    await message.answer(f"🟢 User <code>{user_id}</code> unbanned and restored to discovery.", parse_mode="HTML")
-
-@dp.callback_query(F.data.startswith("admin_unban_"))
-async def cb_admin_unban(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    user_id = int(callback.data.split("_")[2])
-    await db_execute("UPDATE users SET is_banned = 0, is_approved = 1 WHERE telegram_id = ? AND is_verified = 1", user_id)
-    await callback.message.reply(f"🟢 User <code>{user_id}</code> unbanned.", parse_mode="HTML")
-    await callback.answer("Unbanned.")
-
-@dp.callback_query(F.data.startswith("admin_ban_"))
-async def cb_admin_ban(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    user_id = int(callback.data.split("_")[2])
-    await db_execute("UPDATE users SET is_banned = 1, is_approved = 0 WHERE telegram_id = ?", user_id)
-    await callback.message.reply(f"🚫 User <code>{user_id}</code> banned and soft-hidden.", parse_mode="HTML")
-    try:
-        await bot.send_message(user_id, "🚫 Your account has been suspended.")
-    except Exception:
-        pass
-    await callback.answer("Banned.")
-
-# ---------------------------------------------------------
-# Segmented & Global Broadcasts
-# ---------------------------------------------------------
-@dp.message(Command("broadcast"))
-async def cmd_broadcast(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    text = message.text.replace("/broadcast", "", 1).strip()
-    if not text:
-        await message.answer("Usage: <code>/broadcast &lt;message&gt;</code>", parse_mode="HTML")
-        return
-    users = await db_query("SELECT telegram_id FROM users WHERE is_banned = 0")
-    await run_broadcast(users, text, message)
-
-@dp.message(Command("broadcast_country"))
-async def cmd_broadcast_country(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("Usage: <code>/broadcast_country &lt;Country&gt; &lt;message&gt;</code>", parse_mode="HTML")
-        return
-    country, text = parts[1].strip().title(), parts[2].strip()
-    users = await db_query("SELECT telegram_id FROM users WHERE LOWER(country) = LOWER(?) AND is_banned = 0", country)
-    await run_broadcast(users, text, message, target_desc=f"Country: {country}")
-
-@dp.message(Command("broadcast_gender"))
-async def cmd_broadcast_gender(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        await message.answer("Usage: <code>/broadcast_gender &lt;Male|Female&gt; &lt;message&gt;</code>", parse_mode="HTML")
-        return
-    gender, text = parts[1].strip().title(), parts[2].strip()
-    users = await db_query("SELECT telegram_id FROM users WHERE gender = ? AND is_banned = 0", gender)
-    await run_broadcast(users, text, message, target_desc=f"Gender: {gender}")
-
-async def run_broadcast(users, text, admin_msg, target_desc="All Users"):
-    sent, blocked = 0, 0
-    for u in users:
-        uid = u["telegram_id"]
-        try:
-            await bot.send_message(uid, text, parse_mode="HTML")
-            sent += 1
-            await asyncio.sleep(0.05)
-        except TelegramForbiddenError:
-            blocked += 1
-            await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", uid)
-        except Exception:
-            blocked += 1
-
-    await admin_msg.answer(
-        f"✅ <b>Broadcast Completed! ({target_desc})</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked/Failed: {blocked}",
-        parse_mode="HTML"
-    )
-
-# ---------------------------------------------------------
-# Admin Stats & Reminders
-# ---------------------------------------------------------
-@dp.message(Command("admin_stats"))
-async def cmd_admin_stats(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    users_cnt = (await db_query("SELECT COUNT(*) as c FROM users"))[0]['c']
-    verified_cnt = (await db_query("SELECT COUNT(*) as c FROM users WHERE is_verified = 1"))[0]['c']
-    approved_cnt = (await db_query("SELECT COUNT(*) as c FROM users WHERE is_approved = 1"))[0]['c']
-    pending_verif = (await db_query("SELECT COUNT(*) as c FROM users WHERE is_verified = 0 AND is_banned = 0"))[0]['c']
-    dropoffs = (await db_query("""
-        SELECT COUNT(*) as c FROM pending_registrations p 
-        LEFT JOIN users u ON p.telegram_id = u.telegram_id 
-        WHERE u.telegram_id IS NULL
-    """))[0]['c']
-    matches_cnt = (await db_query("SELECT COUNT(*) as c FROM matches"))[0]['c']
-    swipes_cnt = (await db_query("SELECT COUNT(*) as c FROM swipes"))[0]['c']
-    active_roulette = (await db_query("SELECT COUNT(*) as c FROM active_chats"))[0]['c']
-    waiting_roulette = (await db_query("SELECT COUNT(*) as c FROM roulette_queue"))[0]['c']
-    feedback_cnt = (await db_query("SELECT COUNT(*) as c FROM feedback"))[0]['c']
-    reports_cnt = (await db_query("SELECT COUNT(*) as c FROM reports"))[0]['c']
-
-    engine_label = "Neon PostgreSQL (Cloud ☁️)" if is_postgres else "SQLite (Local File 📁)"
-
-    stats_msg = (
-        f"📊 <b>Soulmate Global Administration Dashboard</b>\n\n"
-        f"💾 <b>Database Engine:</b> {engine_label}\n"
-        f"👥 <b>Total Registered:</b> {users_cnt}\n"
-        f"🛡️ <b>Verified Profiles:</b> {verified_cnt}\n"
-        f"🟢 <b>Active in Discovery:</b> {approved_cnt}\n"
-        f"⏳ <b>Awaiting Verification:</b> {pending_verif}\n"
-        f"🚪 <b>Drop-offs:</b> {dropoffs}\n"
-        f"❤️ <b>Total Swipes:</b> {swipes_cnt}\n"
-        f"💍 <b>Total Matches:</b> {matches_cnt}\n"
-        f"🎭 <b>Roulette Rooms Active:</b> {active_roulette // 2}\n"
-        f"⏳ <b>Roulette Queue:</b> {waiting_roulette} waiting\n"
-        f"💬 <b>Feedback Submissions:</b> {feedback_cnt}\n"
-        f"🚨 <b>Total Reports Logged:</b> {reports_cnt}"
-    )
-    await message.answer(stats_msg, parse_mode="HTML")
-
-@dp.message(Command("remind_unverified"))
-async def cmd_remind_unverified(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    rows = await db_query("SELECT telegram_id FROM users WHERE is_verified = 0 AND is_banned = 0")
-    if not rows:
-        await message.answer("✅ No users currently pending verification.")
-        return
-    sent, blocked = 0, 0
-    for r in rows:
-        uid = r["telegram_id"]
-        try:
-            await bot.send_message(
-                uid,
-                "⏳ <b>Your Soulmate Profile is Under Review</b>\n\n"
-                "Our team is currently verifying your gesture selfie. You'll be ready to discover matches very soon!",
-                parse_mode="HTML"
-            )
-            sent += 1
-            await asyncio.sleep(0.05)
-        except TelegramForbiddenError:
-            blocked += 1
-            await db_execute("UPDATE users SET is_approved = 0 WHERE telegram_id = ?", uid)
-        except Exception:
-            blocked += 1
-    await message.answer(f"✅ <b>Reminders Complete!</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked: {blocked}", parse_mode="HTML")
-
-@dp.message(Command("remind_incomplete"))
-async def cmd_remind_incomplete(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    dropoffs = await db_query("""
-        SELECT p.telegram_id FROM pending_registrations p
-        LEFT JOIN users u ON p.telegram_id = u.telegram_id
-        WHERE u.telegram_id IS NULL
-    """)
-    if not dropoffs:
-        await message.answer("✅ No incomplete signups found.")
-        return
-    sent, blocked = 0, 0
-    for d in dropoffs:
-        uid = d["telegram_id"]
-        try:
-            await bot.send_message(
-                uid,
-                "✨ <b>You're almost there!</b>\n\n"
-                "You started setting up your profile on <b>Soulmate Global</b> but didn't finish.\n"
-                "Tap /start to complete your profile in 60 seconds and find genuine matches!",
-                parse_mode="HTML"
-            )
-            sent += 1
-            await asyncio.sleep(0.05)
-        except TelegramForbiddenError:
-            blocked += 1
-            await db_execute("DELETE FROM pending_registrations WHERE telegram_id = ?", uid)
-        except Exception:
-            blocked += 1
-    await message.answer(f"✅ <b>Drop-off Reminders Complete!</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked: {blocked}", parse_mode="HTML")
+        await end_anonymous_session(user_id)
 
 # ---------------------------------------------------------
 # Embedded Web Server (Render Port Binding & Health Check)
 # ---------------------------------------------------------
 async def handle_health(request):
-    return web.Response(text="Soulmate Engine is running healthy!", status=200)
+    return web.Response(text="Soulmate Engine is healthy!", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -1708,7 +1662,6 @@ async def main():
     await init_db()
     await start_web_server()
 
-    # Register admin commands for Telegram client autocomplete
     admin_commands = [
         BotCommand(command="admin", description="🛠️ Admin Control Center & Help"),
         BotCommand(command="admin_stats", description="📊 System & Database Metrics"),
@@ -1721,7 +1674,7 @@ async def main():
     except Exception as e:
         logger.warning(f"Could not register admin command menu: {e}")
 
-    logger.info("Bot is fully operational with Mandatory GPS, Nationality/State Onboarding, and Fixed Photo Handlers...")
+    logger.info("Bot is fully operational with prioritized command routing and isolated relay...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
