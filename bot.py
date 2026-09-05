@@ -9,7 +9,7 @@ from aiohttp import web
 
 # Aiogram 3.x imports
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, KICKED, MEMBER
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -69,16 +69,166 @@ is_postgres = False
 # Geodesic Math Utility (Haversine Formula)
 # ---------------------------------------------------------
 def calculate_distance(lat1, lon1, lat2, lon2):
-    """Calculates distance between two GPS coordinates in Kilometers."""
+    """Calculates geodesic distance between two points in kilometers."""
     if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
         return None
-    R = 6371.0  # Earth radius in km
+    R = 6371.0  # Earth's radius in km
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = (math.sin(dlat / 2) ** 2 +
          math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return round(R * c, 1)
+
+# ---------------------------------------------------------
+# Global Directory (Regions, Nations & States)
+# ---------------------------------------------------------
+GLOBAL_REGIONS = {
+    "🇮🇳 India & South Asia": [
+        "India", "Bangladesh", "Pakistan", "Sri Lanka", "Nepal", 
+        "Bhutan", "Maldives", "Afghanistan"
+    ],
+    "🌏 East & Southeast Asia": [
+        "Japan", "South Korea", "China", "Singapore", "Malaysia", 
+        "Thailand", "Indonesia", "Philippines", "Vietnam", "Taiwan", 
+        "Hong Kong", "Myanmar", "Cambodia", "Laos", "Mongolia"
+    ],
+    "🌍 Europe": [
+        "United Kingdom", "Germany", "France", "Italy", "Spain", 
+        "Netherlands", "Switzerland", "Sweden", "Poland", "Belgium", 
+        "Norway", "Austria", "Ireland", "Denmark", "Finland", 
+        "Portugal", "Greece", "Czech Republic", "Romania", "Hungary", 
+        "Ukraine", "Turkey", "Croatia", "Serbia", "Bulgaria"
+    ],
+    "🌍 Middle East & Africa": [
+        "United Arab Emirates", "Saudi Arabia", "Qatar", "Kuwait", "Oman", 
+        "Bahrain", "Israel", "Egypt", "South Africa", "Nigeria", 
+        "Kenya", "Morocco", "Ghana", "Ethiopia", "Tanzania"
+    ],
+    "🌎 North & Central America": [
+        "United States", "Canada", "Mexico", "Costa Rica", "Panama", 
+        "Jamaica", "Dominican Republic", "Trinidad and Tobago", "Guatemala"
+    ],
+    "🌎 South America": [
+        "Brazil", "Argentina", "Colombia", "Chile", "Peru", 
+        "Ecuador", "Uruguay", "Venezuela", "Paraguay", "Bolivia"
+    ],
+    "🏝️ Oceania / Pacific": [
+        "Australia", "New Zealand", "Fiji", "Papua New Guinea", "Samoa"
+    ]
+}
+
+ALL_INDIA_STATES = [
+    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh",
+    "Goa", "Gujarat", "Haryana", "Himachal Pradesh", "Jharkhand",
+    "Karnataka", "Kerala", "Madhya Pradesh", "Maharashtra", "Manipur",
+    "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Punjab",
+    "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana", "Tripura",
+    "Uttar Pradesh", "Uttarakhand", "West Bengal", "Andaman & Nicobar",
+    "Chandigarh", "Dadra & Nagar Haveli", "Delhi NCR", "Jammu & Kashmir",
+    "Ladakh", "Lakshadweep", "Puducherry"
+]
+
+US_PROVINCES = [
+    "California", "Texas", "Florida", "New York", "Pennsylvania", 
+    "Illinois", "Ohio", "Georgia", "North Carolina", "Michigan",
+    "New Jersey", "Virginia", "Washington", "Arizona", "Massachusetts",
+    "Tennessee", "Indiana", "Missouri", "Maryland", "Wisconsin", "Other State"
+]
+
+CAN_PROVINCES = [
+    "Ontario", "Quebec", "British Columbia", "Alberta", "Manitoba",
+    "Saskatchewan", "Nova Scotia", "New Brunswick", "Other Province"
+]
+
+AUS_STATES = [
+    "New South Wales", "Victoria", "Queensland", "Western Australia",
+    "South Australia", "Tasmania", "ACT", "Northern Territory"
+]
+
+GLOBAL_DIVISIONS = [
+    "Capital City / Metro", "Northern Region", "Southern Region",
+    "Eastern Region", "Western Region", "Central Region", "Other Territory"
+]
+
+def build_regions_keyboard() -> InlineKeyboardMarkup:
+    buttons = []
+    for reg_name in GLOBAL_REGIONS.keys():
+        buttons.append([InlineKeyboardButton(text=reg_name, callback_data=f"sel_reg_{reg_name[:20]}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def build_countries_keyboard(region_key: str, page: int = 0) -> InlineKeyboardMarkup:
+    target_region = None
+    for full_region in GLOBAL_REGIONS.keys():
+        if full_region.startswith(region_key):
+            target_region = full_region
+            break
+    if not target_region:
+        target_region = list(GLOBAL_REGIONS.keys())[0]
+
+    countries = GLOBAL_REGIONS[target_region]
+    per_page = 8
+    total_pages = math.ceil(len(countries) / per_page)
+    start = page * per_page
+    end = start + per_page
+    current_batch = countries[start:end]
+
+    buttons = []
+    row = []
+    for c in current_batch:
+        row.append(InlineKeyboardButton(text=c, callback_data=f"csel_{c[:25]}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"cpage_{region_key}_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"cpage_{region_key}_{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton(text="🌍 Back to Regions", callback_data="back_to_regions")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def build_states_keyboard(country_name: str, page: int = 0) -> InlineKeyboardMarkup:
+    if "India" in country_name:
+        items = ALL_INDIA_STATES
+    elif "United States" in country_name:
+        items = US_PROVINCES
+    elif "Canada" in country_name:
+        items = CAN_PROVINCES
+    elif "Australia" in country_name:
+        items = AUS_STATES
+    else:
+        items = GLOBAL_DIVISIONS
+
+    per_page = 8
+    total_pages = math.ceil(len(items) / per_page)
+    start = page * per_page
+    end = start + per_page
+    current_batch = items[start:end]
+
+    buttons = []
+    row = []
+    for s in current_batch:
+        row.append(InlineKeyboardButton(text=s, callback_data=f"ssel_{s[:25]}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"spage_{country_name[:15]}_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"spage_{country_name[:15]}_{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ---------------------------------------------------------
 # Database Layer (Neon PostgreSQL & SQLite Fallback)
@@ -106,6 +256,8 @@ async def init_db():
             logger.warning("Falling back to local SQLite storage...")
             is_postgres = False
     else:
+        if not asyncpg:
+            logger.warning("⚠️ asyncpg is not installed! Falling back to SQLite.")
         is_postgres = False
 
     schema = """
@@ -188,7 +340,6 @@ async def init_db():
     if is_postgres:
         async with db_pool.acquire() as conn:
             await conn.execute(schema)
-            # Safe column check without syntax errors
             for col in ["country", "state"]:
                 try:
                     await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} TEXT;")
@@ -265,15 +416,11 @@ class EditProfileState(StatesGroup):
     editing_bio = State()
 
 # ---------------------------------------------------------
-# Helpers & Validation
+# Helpers & Keyboard Layouts
 # ---------------------------------------------------------
 def is_valid_name(name: str) -> bool:
     name = name.strip()
     return 2 <= len(name) <= 32 and bool(re.match(r"^[A-Za-z\s.'-]+$", name)) and bool(re.findall(r"[aeiouAEIOU]", name))
-
-def is_valid_text(val: str) -> bool:
-    val = val.strip()
-    return 2 <= len(val) <= 40 and bool(re.match(r"^[A-Za-z\s.-]+$", val))
 
 def safe_user_mention(user_id: int, full_name: str, username: str = None) -> str:
     if username:
@@ -300,7 +447,7 @@ def anon_chat_keyboard():
     )
 
 # ---------------------------------------------------------
-# Lifecycle Management
+# Lifecycle Management (Zero Data Loss)
 # ---------------------------------------------------------
 @dp.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=KICKED))
 async def handle_user_blocked(event: types.ChatMemberUpdated):
@@ -317,7 +464,7 @@ async def handle_user_unblocked(event: types.ChatMemberUpdated):
     await db_execute("UPDATE users SET is_approved = 1 WHERE telegram_id = ? AND is_verified = 1 AND is_banned = 0", user_id)
 
 # ---------------------------------------------------------
-# Admin Control Suite (Placed First to Guarantee Precedence)
+# Admin Control Suite (Prioritized Top Handlers)
 # ---------------------------------------------------------
 @dp.message(Command("admin", "admin_help"))
 async def cmd_admin_help(message: types.Message):
@@ -676,10 +823,11 @@ async def cmd_remind_incomplete(message: types.Message):
     await message.answer(f"✅ <b>Drop-off Reminders Complete!</b>\n\n• 📬 Delivered: {sent}\n• 🚫 Blocked: {blocked}", parse_mode="HTML")
 
 # ---------------------------------------------------------
-# User Registration FSM Handlers
+# User Registration FSM Handlers (GPS + Button Selectors)
 # ---------------------------------------------------------
-@dp.message(CommandStart())
+@dp.message(CommandStart(), StateFilter("*"))
 async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     users = await db_query("SELECT * FROM users WHERE telegram_id = ?", user_id)
 
@@ -710,7 +858,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         reply_markup=ReplyKeyboardRemove()
     )
 
-@dp.message(Registration.name)
+@dp.message(Registration.name, F.text)
 async def process_name(message: types.Message, state: FSMContext):
     name = message.text.strip()
     if not is_valid_name(name):
@@ -720,7 +868,11 @@ async def process_name(message: types.Message, state: FSMContext):
     await state.set_state(Registration.age)
     await message.answer("Great! How old are you? (Enter your real age between 18 and 75)")
 
-@dp.message(Registration.age)
+@dp.message(Registration.name)
+async def fallback_name(message: types.Message):
+    await message.answer("⚠️ Please provide a valid text name.")
+
+@dp.message(Registration.age, F.text)
 async def process_age(message: types.Message, state: FSMContext):
     if not message.text.isdigit() or not (18 <= int(message.text) <= 75):
         await message.answer("⚠️ Please enter a valid age between <b>18 and 75</b>.", parse_mode="HTML")
@@ -734,11 +886,12 @@ async def process_age(message: types.Message, state: FSMContext):
     )
     await message.answer("What is your gender?", reply_markup=kb)
 
-@dp.message(Registration.gender)
+@dp.message(Registration.age)
+async def fallback_age(message: types.Message):
+    await message.answer("⚠️ Please enter your age as a number (18-75).")
+
+@dp.message(Registration.gender, F.text.in_(["Male", "Female", "Other"]))
 async def process_gender(message: types.Message, state: FSMContext):
-    if message.text not in ["Male", "Female", "Other"]:
-        await message.answer("Please choose an option from the buttons below.")
-        return
     await state.update_data(gender=message.text)
     await state.set_state(Registration.target_gender)
     kb = ReplyKeyboardMarkup(
@@ -748,11 +901,12 @@ async def process_gender(message: types.Message, state: FSMContext):
     )
     await message.answer("Who are you interested in meeting?", reply_markup=kb)
 
-@dp.message(Registration.target_gender)
+@dp.message(Registration.gender)
+async def fallback_gender(message: types.Message):
+    await message.answer("⚠️ Please select one of the available gender buttons.")
+
+@dp.message(Registration.target_gender, F.text.in_(["Female", "Male", "Everyone"]))
 async def process_target_gender(message: types.Message, state: FSMContext):
-    if message.text not in ["Female", "Male", "Everyone"]:
-        await message.answer("Please select an option using the keyboard.")
-        return
     await state.update_data(target_gender=message.text)
     await state.set_state(Registration.mandatory_gps)
 
@@ -765,11 +919,15 @@ async def process_target_gender(message: types.Message, state: FSMContext):
     )
     await message.answer(
         "📍 <b>GPS Verification (Mandatory):</b>\n\n"
-        "To prevent fake location spoofing and show accurate distance in kilometers, "
-        "please tap the button below to share your live GPS location.",
+        "To eliminate bots and compute precise distances in kilometers, "
+        "please tap the button below to share your GPS location.",
         parse_mode="HTML",
         reply_markup=gps_kb
     )
+
+@dp.message(Registration.target_gender)
+async def fallback_target_gender(message: types.Message):
+    await message.answer("⚠️ Please tap one of the preference options.")
 
 @dp.message(Registration.mandatory_gps, F.location)
 async def process_mandatory_gps(message: types.Message, state: FSMContext):
@@ -777,15 +935,17 @@ async def process_mandatory_gps(message: types.Message, state: FSMContext):
     lon = message.location.longitude
     await state.update_data(latitude=lat, longitude=lon)
     await state.set_state(Registration.country)
+
     await message.answer(
         "🛰️ <b>GPS Coordinates Verified!</b>\n\n"
-        "What is your <b>Nationality / Country</b>? (e.g. India, United States, UAE, United Kingdom):",
+        "Now, select your <b>World Region</b> to browse your country:",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove()
     )
+    await message.answer("👇 Select your Region:", reply_markup=build_regions_keyboard())
 
 @dp.message(Registration.mandatory_gps)
-async def process_mandatory_gps_invalid(message: types.Message):
+async def fallback_mandatory_gps(message: types.Message):
     gps_kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🛰️ Share Live Location (Mandatory)", request_location=True)]
@@ -795,27 +955,88 @@ async def process_mandatory_gps_invalid(message: types.Message):
     )
     await message.answer("⚠️ You must tap <b>🛰️ Share Live Location</b> to continue.", parse_mode="HTML", reply_markup=gps_kb)
 
-@dp.message(Registration.country)
-async def process_country(message: types.Message, state: FSMContext):
-    country = message.text.strip().title()
-    if not is_valid_text(country):
-        await message.answer("⚠️ Please enter a valid country name (letters only).")
-        return
-    await state.update_data(country=country)
+# Country / Region Callbacks
+@dp.callback_query(Registration.country, F.data.startswith("sel_reg_"))
+async def cb_select_region(callback: types.CallbackQuery):
+    region_key = callback.data.replace("sel_reg_", "")
+    await callback.message.edit_text(
+        "🌍 <b>Select your Country:</b>",
+        parse_mode="HTML",
+        reply_markup=build_countries_keyboard(region_key, page=0)
+    )
+    await callback.answer()
+
+@dp.callback_query(Registration.country, F.data.startswith("cpage_"))
+async def cb_paginate_countries(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    region_key = parts[1]
+    page = int(parts[2])
+    await callback.message.edit_reply_markup(reply_markup=build_countries_keyboard(region_key, page=page))
+    await callback.answer()
+
+@dp.callback_query(Registration.country, F.data == "back_to_regions")
+async def cb_back_to_regions(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "🌍 <b>Select your World Region:</b>",
+        parse_mode="HTML",
+        reply_markup=build_regions_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(Registration.country, F.data.startswith("csel_"))
+async def cb_select_country(callback: types.CallbackQuery, state: FSMContext):
+    country_name = callback.data.replace("csel_", "")
+    await state.update_data(country=country_name)
     await state.set_state(Registration.state_province)
-    await message.answer(f"Got it, {country}! Now enter your <b>State / Province</b> (e.g. Jharkhand, Maharashtra, California):", parse_mode="HTML")
+
+    await callback.message.edit_text(
+        f"Selected Country: <b>{country_name}</b> ✅\n\n"
+        f"Now, select your <b>State / Province / Region</b> below:",
+        parse_mode="HTML",
+        reply_markup=build_states_keyboard(country_name, page=0)
+    )
+    await callback.answer()
+
+@dp.message(Registration.country)
+async def fallback_country_prompt(message: types.Message):
+    await message.answer("⚠️ Please select your Country using the interactive buttons above.", reply_markup=build_regions_keyboard())
+
+# State / Province Callbacks
+@dp.callback_query(Registration.state_province, F.data.startswith("spage_"))
+async def cb_paginate_states(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    country_name = data.get("country", "India")
+    parts = callback.data.split("_")
+    page = int(parts[2])
+    await callback.message.edit_reply_markup(reply_markup=build_states_keyboard(country_name, page=page))
+    await callback.answer()
+
+@dp.callback_query(Registration.state_province, F.data.startswith("ssel_"))
+async def cb_select_state(callback: types.CallbackQuery, state: FSMContext):
+    state_name = callback.data.replace("ssel_", "")
+    await state.update_data(state=state_name)
+    await state.set_state(Registration.bio)
+
+    data = await state.get_data()
+    country_name = data.get("country", "Global")
+
+    await callback.message.edit_text(
+        f"📍 Location Locked: <b>{state_name}, {country_name}</b> ✅",
+        parse_mode="HTML"
+    )
+    await callback.message.answer(
+        "Write a short bio about yourself (passions, lifestyle, what you are looking for):",
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
 @dp.message(Registration.state_province)
-async def process_state(message: types.Message, state: FSMContext):
-    state_prov = message.text.strip().title()
-    if not is_valid_text(state_prov):
-        await message.answer("⚠️ Please enter a valid state/province name (letters only).")
-        return
-    await state.update_data(state=state_prov)
-    await state.set_state(Registration.bio)
-    await message.answer("Write a short bio about yourself (passions, lifestyle, hobbies):")
+async def fallback_state_prompt(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    country_name = data.get("country", "India")
+    await message.answer("⚠️ Please select your State using the interactive buttons above.", reply_markup=build_states_keyboard(country_name, page=0))
 
-@dp.message(Registration.bio)
+@dp.message(Registration.bio, F.text)
 async def process_bio(message: types.Message, state: FSMContext):
     bio_text = message.text.strip()
     if len(bio_text) < 5 or len(bio_text) > 400:
@@ -825,20 +1046,33 @@ async def process_bio(message: types.Message, state: FSMContext):
     await state.set_state(Registration.photo)
     await message.answer("📸 Please upload your primary profile picture:")
 
-@dp.message(Registration.photo, F.photo)
+@dp.message(Registration.bio)
+async def fallback_bio(message: types.Message):
+    await message.answer("⚠️ Please provide a short text bio.")
+
+@dp.message(Registration.photo, F.photo | F.document)
 async def process_photo(message: types.Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
+    photo_id = None
+    if message.photo:
+        photo_id = message.photo[-1].file_id
+    elif message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        photo_id = message.document.file_id
+
+    if not photo_id:
+        await message.answer("⚠️ Please send an image photo.")
+        return
+
     await state.update_data(photo_id=photo_id)
     await state.set_state(Registration.gesture_selfie)
     await message.answer(
         "✌️ <b>Anti-Fake Verification Step</b>\n\n"
         "To earn the <b>Blue Shield Badge 🛡️</b> and prevent catfishing, upload a selfie holding up a <b>Peace Sign (✌️)</b>.\n\n"
-        "<i>Send as photo or uncompressed image. This photo is strictly confidential and is never shown publicly on your profile.</i>",
+        "<i>Send as a regular photo or uncompressed image file. This photo is strictly confidential and is never shown publicly on your profile.</i>",
         parse_mode="HTML"
     )
 
 @dp.message(Registration.photo)
-async def process_photo_invalid(message: types.Message):
+async def fallback_photo(message: types.Message):
     await message.answer("⚠️ Please upload an image photo for your profile.")
 
 @dp.message(Registration.gesture_selfie, F.photo | F.document)
@@ -850,66 +1084,67 @@ async def process_gesture_selfie(message: types.Message, state: FSMContext):
         gesture_photo_id = message.document.file_id
 
     if not gesture_photo_id:
-        await message.answer("⚠️ Please send an actual image holding up a Peace Sign (✌️).")
+        await message.answer("⚠️ Please send an image photo holding up a Peace Sign (✌️).")
         return
 
     data = await state.get_data()
     user_id = message.from_user.id
     username = message.from_user.username or ""
 
-    await db_execute("""
-        INSERT INTO users (
-            telegram_id, full_name, username, age, gender, target_gender,
-            country, state, latitude, longitude, bio, photo_id, gesture_photo_id,
-            karma_score, is_verified, is_approved, is_banned
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, 0, 0, 0)
-        ON CONFLICT (telegram_id) DO UPDATE SET
-            full_name = EXCLUDED.full_name,
-            username = EXCLUDED.username,
-            age = EXCLUDED.age,
-            gender = EXCLUDED.gender,
-            target_gender = EXCLUDED.target_gender,
-            country = EXCLUDED.country,
-            state = EXCLUDED.state,
-            latitude = EXCLUDED.latitude,
-            longitude = EXCLUDED.longitude,
-            bio = EXCLUDED.bio,
-            photo_id = EXCLUDED.photo_id,
-            gesture_photo_id = EXCLUDED.gesture_photo_id,
-            is_verified = 0,
-            is_approved = 0
-    """, user_id, data['full_name'], username, data['age'], data['gender'],
-       data['target_gender'], data['country'], data['state'], data['latitude'], data['longitude'],
-       data['bio'], data['photo_id'], gesture_photo_id)
-
-    await db_execute("DELETE FROM pending_registrations WHERE telegram_id = ?", user_id)
-    await state.clear()
-
-    await message.answer(
-        "🎉 <b>Profile & Gesture Selfie Received!</b>\n\n"
-        "Our moderators are reviewing your peace sign gesture selfie. You'll receive a notification here once approved!",
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
-    )
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Approve", callback_data=f"verify_ok_{user_id}"),
-            InlineKeyboardButton(text="⚠️ Retake Selfie", callback_data=f"verify_retry_{user_id}")
-        ],
-        [InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{user_id}")]
-    ])
-    user_link = safe_user_mention(user_id, data['full_name'], username)
-    caption = (
-        f"🚨 <b>New Profile Verification Request</b>\n\n"
-        f"👤 <b>User:</b> {user_link} (<code>{user_id}</code>)\n"
-        f"🎂 <b>Age/Gender:</b> {data['age']} | {data['gender']} (Seeking: {data['target_gender']})\n"
-        f"📍 <b>Location:</b> {data['state']}, {data['country']}\n"
-        f"📝 <b>Bio:</b> {data['bio']}"
-    )
-
     try:
-        await bot.send_photo(ADMIN_ID, data['photo_id'], caption=caption, parse_mode="HTML")
+        await db_execute("""
+            INSERT INTO users (
+                telegram_id, full_name, username, age, gender, target_gender,
+                country, state, latitude, longitude, bio, photo_id, gesture_photo_id,
+                karma_score, is_verified, is_approved, is_banned
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, 0, 0, 0)
+            ON CONFLICT (telegram_id) DO UPDATE SET
+                full_name = EXCLUDED.full_name,
+                username = EXCLUDED.username,
+                age = EXCLUDED.age,
+                gender = EXCLUDED.gender,
+                target_gender = EXCLUDED.target_gender,
+                country = EXCLUDED.country,
+                state = EXCLUDED.state,
+                latitude = EXCLUDED.latitude,
+                longitude = EXCLUDED.longitude,
+                bio = EXCLUDED.bio,
+                photo_id = EXCLUDED.photo_id,
+                gesture_photo_id = EXCLUDED.gesture_photo_id,
+                is_verified = 0,
+                is_approved = 0
+        """, user_id, data.get('full_name', 'Anonymous'), username, data.get('age', 18), data.get('gender', 'Other'),
+           data.get('target_gender', 'Everyone'), data.get('country', 'India'), data.get('state', 'Unknown'),
+           data.get('latitude'), data.get('longitude'), data.get('bio', ''), data.get('photo_id', ''), gesture_photo_id)
+
+        await db_execute("DELETE FROM pending_registrations WHERE telegram_id = ?", user_id)
+        await state.clear()
+
+        await message.answer(
+            "🎉 <b>Profile & Gesture Selfie Received!</b>\n\n"
+            "Our moderators are reviewing your peace sign gesture selfie. You'll receive a notification here once approved!",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard()
+        )
+
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Approve", callback_data=f"verify_ok_{user_id}"),
+                InlineKeyboardButton(text="⚠️ Retake Selfie", callback_data=f"verify_retry_{user_id}")
+            ],
+            [InlineKeyboardButton(text="🚫 Ban", callback_data=f"admin_ban_{user_id}")]
+        ])
+        user_link = safe_user_mention(user_id, data.get('full_name', 'New User'), username)
+        caption = (
+            f"🚨 <b>New Profile Verification Request</b>\n\n"
+            f"👤 <b>User:</b> {user_link} (<code>{user_id}</code>)\n"
+            f"🎂 <b>Age/Gender:</b> {data.get('age')} | {data.get('gender')} (Seeking: {data.get('target_gender')})\n"
+            f"📍 <b>Location:</b> {data.get('state')}, {data.get('country')}\n"
+            f"📝 <b>Bio:</b> {data.get('bio')}"
+        )
+
+        if data.get('photo_id'):
+            await bot.send_photo(ADMIN_ID, data['photo_id'], caption=caption, parse_mode="HTML")
         await bot.send_photo(
             ADMIN_ID, gesture_photo_id,
             caption=f"✌️ <b>Verification Gesture Selfie</b> for <code>{user_id}</code>",
@@ -917,11 +1152,12 @@ async def process_gesture_selfie(message: types.Message, state: FSMContext):
             reply_markup=admin_kb
         )
     except Exception as e:
-        logger.error(f"Failed to deliver verification alert to admin: {e}")
+        logger.error(f"Error processing gesture selfie for {user_id}: {e}")
+        await message.answer(f"⚠️ An error occurred while saving your profile: {e}\nPlease type /start to try again.")
 
 @dp.message(Registration.gesture_selfie)
 async def fallback_gesture_selfie(message: types.Message):
-    await message.answer("⚠️ Please upload a <b>photo</b> of you holding up a Peace Sign (✌️).", parse_mode="HTML")
+    await message.answer("⚠️ Please upload a <b>photo</b> of you holding up a Peace Sign (✌️) to finish verification.", parse_mode="HTML")
 
 # ---------------------------------------------------------
 # Verification Callbacks & Selfie Retake Flow
@@ -1012,9 +1248,9 @@ async def process_retake_photo(message: types.Message, state: FSMContext):
     )
 
 # ---------------------------------------------------------
-# Profile Management & Full Profile Editing Suite
+# Profile Management & In-App Editing Suite
 # ---------------------------------------------------------
-@dp.message(F.text.in_(["👤 My Profile", "/profile"]))
+@dp.message(StateFilter(None), F.text.in_(["👤 My Profile", "/profile"]))
 async def cmd_my_profile(message: types.Message):
     user_id = message.from_user.id
     rows = await db_query("SELECT * FROM users WHERE telegram_id = ?", user_id)
@@ -1053,9 +1289,12 @@ async def cb_edit_photo(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.reply("📸 Send your new portrait profile photo:")
     await callback.answer()
 
-@dp.message(EditProfileState.editing_photo, F.photo)
+@dp.message(EditProfileState.editing_photo, F.photo | F.document)
 async def process_edit_photo(message: types.Message, state: FSMContext):
-    photo_id = message.photo[-1].file_id
+    photo_id = message.photo[-1].file_id if message.photo else (message.document.file_id if message.document else None)
+    if not photo_id:
+        await message.answer("⚠️ Please send an image photo.")
+        return
     await db_execute("UPDATE users SET photo_id = ? WHERE telegram_id = ?", photo_id, message.from_user.id)
     await state.clear()
     await message.answer("✅ Profile photo updated successfully!", reply_markup=main_menu_keyboard())
@@ -1066,7 +1305,7 @@ async def cb_edit_bio(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.reply("📝 Type your new profile bio below:")
     await callback.answer()
 
-@dp.message(EditProfileState.editing_bio)
+@dp.message(EditProfileState.editing_bio, F.text)
 async def process_edit_bio(message: types.Message, state: FSMContext):
     bio_text = message.text.strip()
     if len(bio_text) < 5 or len(bio_text) > 400:
@@ -1125,7 +1364,7 @@ async def cb_do_soft_delete(callback: types.CallbackQuery):
 # ---------------------------------------------------------
 # Interactive Matches Tab
 # ---------------------------------------------------------
-@dp.message(F.text == "💌 Matches")
+@dp.message(StateFilter(None), F.text == "💌 Matches")
 async def cmd_matches(message: types.Message):
     user_id = message.from_user.id
     matches = await db_query("""
@@ -1170,7 +1409,7 @@ async def check_daily_swipe_limit(user_id: int) -> bool:
         """, user_id)
     return count_row[0]['c'] >= DAILY_SWIPE_LIMIT
 
-@dp.message(F.text.in_(["🔍 Discover (Proximity)", "🔍 Discover Matches"]))
+@dp.message(StateFilter(None), F.text.in_(["🔍 Discover (Proximity)", "🔍 Discover Matches"]))
 async def cmd_discover(message: types.Message):
     user_id = message.from_user.id
     current_users = await db_query("SELECT * FROM users WHERE telegram_id = ?", user_id)
@@ -1288,9 +1527,9 @@ async def handle_swipe(callback: types.CallbackQuery):
     await callback.answer()
 
 # ---------------------------------------------------------
-# Anonymous Chat Roulette Engine
+# Anonymous Chat Roulette Engine (Database-Backed)
 # ---------------------------------------------------------
-@dp.message(F.text.in_(["⚡ Random Chat Roulette", "/roulette"]))
+@dp.message(StateFilter(None), F.text.in_(["⚡ Random Chat Roulette", "/roulette"]))
 async def cmd_chat_roulette_menu(message: types.Message):
     user_id = message.from_user.id
     active = await db_query("SELECT * FROM active_chats WHERE user_id = ?", user_id)
@@ -1435,13 +1674,13 @@ async def end_anonymous_session(user_id: int, send_notice: bool = True):
             pass
     return partner_id
 
-@dp.message(F.text.in_(["⏹️ End Chat", "/end", "/stop"]))
+@dp.message(StateFilter(None), F.text.in_(["⏹️ End Chat", "/end", "/stop"]))
 async def cmd_end_chat(message: types.Message):
     ended = await end_anonymous_session(message.from_user.id)
     if not ended:
         await message.answer("You are not currently in an active anonymous chat.", reply_markup=main_menu_keyboard())
 
-@dp.message(F.text.in_(["⏭️ Next Person", "/next"]))
+@dp.message(StateFilter(None), F.text.in_(["⏭️ Next Person", "/next"]))
 async def cmd_next_person(message: types.Message):
     await end_anonymous_session(message.from_user.id)
     u_rows = await db_query("SELECT * FROM users WHERE telegram_id = ?", message.from_user.id)
@@ -1454,7 +1693,7 @@ async def cmd_next_person(message: types.Message):
         """, message.from_user.id, me['gender'], me['target_gender'], me.get('country', ''), me.get('state', ''))
     await message.answer("🔍 Looking for a new partner...", reply_markup=ReplyKeyboardRemove())
 
-@dp.message(F.text == "📍 Share Proximity")
+@dp.message(StateFilter(None), F.text == "📍 Share Proximity")
 async def cmd_share_proximity(message: types.Message):
     user_id = message.from_user.id
     active = await db_query("SELECT partner_id FROM active_chats WHERE user_id = ?", user_id)
@@ -1479,7 +1718,7 @@ async def cmd_share_proximity(message: types.Message):
     except Exception:
         pass
 
-@dp.message(F.text == "🚨 Report Stranger")
+@dp.message(StateFilter(None), F.text == "🚨 Report Stranger")
 async def cmd_report_stranger(message: types.Message):
     user_id = message.from_user.id
     active = await db_query("SELECT partner_id FROM active_chats WHERE user_id = ?", user_id)
@@ -1512,7 +1751,7 @@ async def cb_rate_user(callback: types.CallbackQuery):
 # ---------------------------------------------------------
 # Feedback & Reporting
 # ---------------------------------------------------------
-@dp.message(F.text.in_(["/feedback", "💬 Feedback"]))
+@dp.message(StateFilter(None), F.text.in_(["/feedback", "💬 Feedback"]))
 async def cmd_feedback(message: types.Message, state: FSMContext):
     await state.set_state(FeedbackStates.waiting_for_feedback)
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1531,7 +1770,7 @@ async def cb_cancel_feedback(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Feedback cancelled.")
     await callback.answer()
 
-@dp.message(FeedbackStates.waiting_for_feedback)
+@dp.message(FeedbackStates.waiting_for_feedback, F.text | F.caption)
 async def process_feedback(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     feedback_text = message.text or message.caption or "[Media / Attachment]"
@@ -1556,6 +1795,36 @@ async def process_feedback(message: types.Message, state: FSMContext):
         await bot.send_message(ADMIN_ID, admin_alert, parse_mode="HTML", reply_markup=admin_markup)
     except Exception as e:
         logger.error(f"Failed to alert admin of feedback: {e}")
+
+@dp.callback_query(F.data.startswith("admin_prep_reply_"))
+async def cb_admin_prep_reply(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    user_id = int(callback.data.split("_")[3])
+    await state.update_data(reply_target_id=user_id)
+    await state.set_state(AdminReplyState.waiting_for_reply)
+    await callback.message.reply(f"✍️ Type your official reply message for user <code>{user_id}</code>:")
+    await callback.answer()
+
+@dp.message(AdminReplyState.waiting_for_reply, F.text)
+async def process_admin_reply(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    data = await state.get_data()
+    target_id = data.get("reply_target_id")
+    reply_text = message.text
+    
+    try:
+        await bot.send_message(
+            target_id,
+            f"💌 <b>Message from Soulmate Support:</b>\n\n{reply_text}",
+            parse_mode="HTML"
+        )
+        await message.answer(f"✅ Official reply delivered to <code>{target_id}</code>!", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Failed to deliver: {e}")
+    finally:
+        await state.clear()
 
 @dp.callback_query(F.data.startswith("report_card_"))
 async def cb_report_card(callback: types.CallbackQuery):
@@ -1609,16 +1878,10 @@ async def cb_dismiss_report(callback: types.CallbackQuery):
     await callback.answer("Report dismissed.")
 
 # ---------------------------------------------------------
-# Anonymous Chat Relay Handler (STRICTLY CONSTRAINED)
+# Anonymous Relay Handler (Isolated at the Bottom)
 # ---------------------------------------------------------
-# Placed at the very bottom: Only triggers if the message is NOT a command,
-# the user is NOT in an FSM state, and they have an active row in active_chats!
-@dp.message(F.chat.type == "private", ~F.text.startswith("/"))
-async def relay_anonymous_chat(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is not None:
-        return
-
+@dp.message(StateFilter(None), F.chat.type == "private", ~F.text.startswith("/"))
+async def relay_anonymous_chat(message: types.Message):
     user_id = message.from_user.id
     active = await db_query("SELECT partner_id FROM active_chats WHERE user_id = ?", user_id)
     if not active:
@@ -1640,10 +1903,10 @@ async def relay_anonymous_chat(message: types.Message, state: FSMContext):
         await end_anonymous_session(user_id)
 
 # ---------------------------------------------------------
-# Embedded Web Server (Render Port Binding & Health Check)
+# Embedded Web Server (Render Web Service Port Binding)
 # ---------------------------------------------------------
 async def handle_health(request):
-    return web.Response(text="Soulmate Engine is healthy!", status=200)
+    return web.Response(text="Soulmate Engine is running healthy!", status=200)
 
 async def start_web_server():
     app = web.Application()
@@ -1674,7 +1937,7 @@ async def main():
     except Exception as e:
         logger.warning(f"Could not register admin command menu: {e}")
 
-    logger.info("Bot is fully operational with prioritized command routing and isolated relay...")
+    logger.info("Bot is fully operational with prioritized routing, database persistence, and robust validation...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
