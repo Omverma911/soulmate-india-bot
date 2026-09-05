@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import html
 import math
 import asyncio
 import logging
@@ -231,7 +232,7 @@ def build_states_keyboard(country_name: str, page: int = 0) -> InlineKeyboardMar
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ---------------------------------------------------------
-# Database Layer (Neon PostgreSQL & SQLite Fallback)
+# Database Layer (Neon PostgreSQL & SQLite Fallback + Auto Migration)
 # ---------------------------------------------------------
 async def init_db():
     global db_pool, is_postgres
@@ -340,11 +341,33 @@ async def init_db():
     if is_postgres:
         async with db_pool.acquire() as conn:
             await conn.execute(schema)
-            for col in ["country", "state"]:
+            # Comprehensive Auto-Migration to adapt pre-existing tables
+            columns_to_ensure = [
+                ("full_name", "TEXT"),
+                ("username", "TEXT"),
+                ("age", "INT"),
+                ("gender", "TEXT"),
+                ("target_gender", "TEXT"),
+                ("country", "TEXT"),
+                ("state", "TEXT"),
+                ("latitude", "DOUBLE PRECISION"),
+                ("longitude", "DOUBLE PRECISION"),
+                ("bio", "TEXT"),
+                ("photo_id", "TEXT"),
+                ("gesture_photo_id", "TEXT"),
+                ("karma_score", "INT DEFAULT 100"),
+                ("total_chats", "INT DEFAULT 0"),
+                ("is_verified", "INT DEFAULT 0"),
+                ("is_approved", "INT DEFAULT 0"),
+                ("is_banned", "INT DEFAULT 0")
+            ]
+            for col_name, col_type in columns_to_ensure:
                 try:
-                    await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} TEXT;")
+                    await conn.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col_name} {col_type};")
                 except Exception:
                     pass
+
+            for col in ["country", "state", "mode"]:
                 try:
                     await conn.execute(f"ALTER TABLE roulette_queue ADD COLUMN IF NOT EXISTS {col} TEXT;")
                 except Exception:
@@ -423,9 +446,10 @@ def is_valid_name(name: str) -> bool:
     return 2 <= len(name) <= 32 and bool(re.match(r"^[A-Za-z\s.'-]+$", name)) and bool(re.findall(r"[aeiouAEIOU]", name))
 
 def safe_user_mention(user_id: int, full_name: str, username: str = None) -> str:
+    escaped_name = html.escape(full_name or "Anonymous")
     if username:
         return f"@{username}"
-    return f'<a href="tg://user?id={user_id}">{full_name}</a>'
+    return f'<a href="tg://user?id={user_id}">{escaped_name}</a>'
 
 def main_menu_keyboard():
     return ReplyKeyboardMarkup(
@@ -594,8 +618,11 @@ async def inspect_user_profile(user_id: int, message_or_obj):
     matches_cnt = (await db_query("SELECT COUNT(*) as c FROM matches WHERE user1_id = ? OR user2_id = ?", user_id, user_id))[0]['c']
     reports_cnt = (await db_query("SELECT COUNT(*) as c FROM reports WHERE reported_id = ?", user_id))[0]['c']
 
-    user_link = safe_user_mention(u['telegram_id'], u['full_name'], u['username'])
-    loc_str = f"{u.get('state', '')}, {u.get('country', '')}".strip(", ") or "GPS Stored"
+    escaped_name = html.escape(u.get('full_name') or 'Anonymous')
+    escaped_bio = html.escape(u.get('bio') or 'No bio provided.')
+    user_link = f'<a href="tg://user?id={user_id}">{escaped_name}</a>' if not u.get('username') else f"@{u['username']}"
+    loc_str = html.escape(f"{u.get('state', '')}, {u.get('country', '')}".strip(", ") or "GPS Stored")
+
     details = (
         f"🔍 <b>User Dossier:</b> {user_link}\n\n"
         f"• <b>Telegram ID:</b> <code>{u['telegram_id']}</code>\n"
@@ -607,7 +634,7 @@ async def inspect_user_profile(user_id: int, message_or_obj):
         f"• <b>Status:</b> {'🚫 BANNED' if u['is_banned'] else 'Normal'}\n"
         f"• <b>Activity:</b> Given: {likes_given} ❤️ | Received: {likes_received} 💌\n"
         f"• <b>Matches:</b> {matches_cnt} | <b>Reports:</b> {reports_cnt} 🚨\n\n"
-        f"📝 <b>Bio:</b> {u['bio']}"
+        f"📝 <b>Bio:</b> <i>{escaped_bio}</i>"
     )
 
     action_buttons = []
@@ -618,7 +645,20 @@ async def inspect_user_profile(user_id: int, message_or_obj):
     action_buttons.append(InlineKeyboardButton(text="💬 Message", callback_data=f"admin_prep_reply_{user_id}"))
 
     kb = InlineKeyboardMarkup(inline_keyboard=[action_buttons])
-    await message_or_obj.reply_photo(u['photo_id'], caption=details, parse_mode="HTML", reply_markup=kb)
+
+    photo_id = u.get("photo_id")
+    if photo_id:
+        try:
+            await message_or_obj.reply_photo(photo_id, caption=details, parse_mode="HTML", reply_markup=kb)
+            return
+        except Exception as e:
+            logger.warning(f"Could not display photo for user {user_id} (likely expired file_id): {e}")
+
+    await message_or_obj.reply(
+        f"{details}\n\n<i>⚠️ Note: Primary profile photo unavailable or expired.</i>",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
 
 @dp.message(Command("ban"))
 async def cmd_ban(message: types.Message):
